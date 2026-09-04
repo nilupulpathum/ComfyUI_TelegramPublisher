@@ -11,9 +11,11 @@ import pytest
 
 from storage.config import (
     Account,
+    BotSettings,
     ConfigStore,
     Destination,
     FileSecretStore,
+    Trigger,
 )
 
 
@@ -282,3 +284,165 @@ def test_secret_file_owner_only_permissions(tmp_path: Path) -> None:
     secrets.set_token("acc1", TOKEN_A)
     mode = stat.S_IMODE(os.stat(tmp_path / "secrets.json").st_mode)
     assert mode == 0o600
+
+
+# ---------------------------------------------------------------------------
+# Bot settings (T060 remote-control configuration; append-only additions)
+# ---------------------------------------------------------------------------
+
+
+def test_settings_default_when_absent(tmp_path: Path) -> None:
+    config, _ = make_store(tmp_path)
+    assert config.get_settings() == BotSettings()
+    assert config.get_settings().admin_chat_ids == ()
+    assert config.get_settings().comfy_host == "127.0.0.1"
+    assert config.get_settings().comfy_port == 8188
+    assert config.get_settings().review_mode is False
+    assert config.get_settings().triggers == ()
+
+
+def test_settings_save_get_round_trip_and_reload(tmp_path: Path) -> None:
+    config, _ = make_store(tmp_path)
+    saved = config.save_settings(
+        BotSettings(
+            review_mode=True,
+            admin_chat_ids=["123", "@admin"],
+            comfy_host="localhost",
+            comfy_port=8199,
+            triggers=[Trigger(name="t1", prompt_file="p1.json")],
+        )
+    )
+    assert saved.admin_chat_ids == ("123", "@admin")
+    assert saved.triggers == (Trigger(name="t1", prompt_file="p1.json"),)
+    got = config.get_settings()
+    assert got == saved
+    reloaded = ConfigStore(tmp_path / "config.json")
+    assert reloaded.get_settings() == saved
+
+
+def test_settings_save_preserves_accounts_and_destinations(
+    tmp_path: Path,
+) -> None:
+    config, _ = make_store(tmp_path)
+    config.add_account(Account(id="acc1", name="Main bot"))
+    config.add_destination(
+        Destination(id="d1", name="Chan", account_id="acc1", chat_id="@chan")
+    )
+    config.save_settings(BotSettings(admin_chat_ids=["1"]))
+    reloaded = ConfigStore(tmp_path / "config.json")
+    assert reloaded.get_account("acc1") == Account(id="acc1", name="Main bot")
+    assert reloaded.get_destination("d1").chat_id == "@chan"
+    assert reloaded.get_settings().admin_chat_ids == ("1",)
+
+
+def test_settings_get_returns_independent_copy(tmp_path: Path) -> None:
+    config, _ = make_store(tmp_path)
+    config.save_settings(
+        BotSettings(
+            admin_chat_ids=["1"],
+            triggers=[Trigger(name="t", prompt_file="p.json")],
+        )
+    )
+    first = config.get_settings()
+    second = config.get_settings()
+    assert first == second
+    assert first.triggers[0] is not second.triggers[0]
+
+
+def test_settings_rejects_bad_admin_ids(tmp_path: Path) -> None:
+    config, _ = make_store(tmp_path)
+    for bad_ids in ([""], ["   "], ["ok", ""], ["ok", 42], "123", "abc", 42):
+        with pytest.raises(ValueError):
+            config.save_settings(BotSettings(admin_chat_ids=bad_ids))  # type: ignore[arg-type]
+
+
+def test_settings_rejects_non_loopback_host(tmp_path: Path) -> None:
+    config, _ = make_store(tmp_path)
+    for bad_host in ("0.0.0.0", "example.com", "192.168.1.1", "", "   ", None, 42):
+        with pytest.raises(ValueError):
+            config.save_settings(BotSettings(comfy_host=bad_host))  # type: ignore[arg-type]
+    for good_host in ("127.0.0.1", "localhost", "::1"):
+        saved = config.save_settings(BotSettings(comfy_host=good_host))
+        assert saved.comfy_host == good_host
+
+
+def test_settings_rejects_bad_port(tmp_path: Path) -> None:
+    config, _ = make_store(tmp_path)
+    for bad_port in (0, -1, 65536, "8188", 81.88, True, None):
+        with pytest.raises(ValueError):
+            config.save_settings(BotSettings(comfy_port=bad_port))  # type: ignore[arg-type]
+
+
+def test_settings_rejects_bad_review_mode_and_wrong_types(tmp_path: Path) -> None:
+    config, _ = make_store(tmp_path)
+    with pytest.raises(ValueError):
+        config.save_settings(BotSettings(review_mode="yes"))  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        config.save_settings("nope")  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        config.save_settings(
+            BotSettings(triggers=["t1"])  # type: ignore[list-item]
+        )
+
+
+def test_trigger_rejects_empty_fields() -> None:
+    with pytest.raises(ValueError):
+        Trigger(name="", prompt_file="p.json")
+    with pytest.raises(ValueError):
+        Trigger(name="   ", prompt_file="p.json")
+    with pytest.raises(ValueError):
+        Trigger(name="t", prompt_file="")
+    with pytest.raises(ValueError):
+        Trigger(name="t", prompt_file=42)  # type: ignore[arg-type]
+
+
+def test_settings_rejects_duplicate_trigger_names(tmp_path: Path) -> None:
+    config, _ = make_store(tmp_path)
+    with pytest.raises(ValueError, match="dup"):
+        config.save_settings(
+            BotSettings(
+                triggers=[
+                    Trigger(name="dup", prompt_file="a.json"),
+                    Trigger(name="dup", prompt_file="b.json"),
+                ]
+            )
+        )
+
+
+def test_settings_load_rejects_corrupt_object(tmp_path: Path) -> None:
+    cases = [
+        {"settings": "nope"},
+        {"settings": {"comfy_host": "example.com"}},
+        {"settings": {"comfy_port": 0}},
+        {"settings": {"admin_chat_ids": [""]}},
+        {"settings": {"review_mode": "yes"}},
+        {"settings": {"bogus_key": 1}},
+        {"settings": {"triggers": [{"name": "t"}]}},
+        {
+            "settings": {
+                "triggers": [
+                    {"name": "t", "prompt_file": "a.json"},
+                    {"name": "t", "prompt_file": "b.json"},
+                ]
+            }
+        },
+    ]
+    for payload in cases:
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(ValueError):
+            ConfigStore(path)
+
+
+def test_settings_file_round_trips_json_shape(tmp_path: Path) -> None:
+    config, _ = make_store(tmp_path)
+    config.save_settings(
+        BotSettings(
+            admin_chat_ids=["42"],
+            triggers=[Trigger(name="t", prompt_file="p.json")],
+        )
+    )
+    raw = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert raw["settings"]["admin_chat_ids"] == ["42"]
+    assert raw["settings"]["triggers"] == [{"name": "t", "prompt_file": "p.json"}]
+    assert TOKEN_A.encode() not in (tmp_path / "config.json").read_bytes()

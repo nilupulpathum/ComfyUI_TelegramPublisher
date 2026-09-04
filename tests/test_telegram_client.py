@@ -430,3 +430,132 @@ def test_invalid_timeout_raises_before_transport(bad):
     with pytest.raises(ValueError):
         client.send_media_group("@chan", [(b"x", "a.png")], timeout=bad)
     assert calls == []
+
+
+# -- T060 get_updates: long-poll receiver primitive (append-only additions) --
+
+
+def _updates_transport(result, record=None, status=200):
+    def fake(url, *, files, data, timeout):
+        assert url.startswith("https://api.telegram.org/bot")
+        assert FAKE_TOKEN in url
+        assert "getUpdates" in url
+        if record is not None:
+            record.append({"url": url, "data": data, "timeout": timeout})
+        return status, {"ok": status == 200, "result": result}
+
+    return fake
+
+
+def test_get_updates_happy_path_returns_raw_list():
+    updates = [
+        {"update_id": 1, "message": {"chat": {"id": 5}, "text": "/status"}},
+        {"update_id": 2, "edited_message": {"text": "x"}},
+    ]
+    client = TelegramClient(FAKE_TOKEN, transport=_updates_transport(updates))
+    assert client.get_updates() == updates
+
+
+def test_get_updates_passes_offset_and_timeout_params():
+    record: list = []
+    client = TelegramClient(
+        FAKE_TOKEN, transport=_updates_transport([], record)
+    )
+    assert client.get_updates(offset=41, timeout=17) == []
+    assert record[0]["data"] == {"timeout": 17, "offset": 41}
+
+
+def test_get_updates_default_params_omit_offset():
+    record: list = []
+    client = TelegramClient(
+        FAKE_TOKEN, transport=_updates_transport([], record)
+    )
+    client.get_updates()
+    assert record[0]["data"] == {"timeout": 30}
+
+
+def test_get_updates_http_timeout_exceeds_poll_window():
+    # Long-polling holds the connection for the whole poll window, so the
+    # HTTP timeout must be longer: max(client timeout, poll + 10).
+    record: list = []
+    client = TelegramClient(
+        FAKE_TOKEN, timeout=30.0, transport=_updates_transport([], record)
+    )
+    client.get_updates(timeout=30)
+    assert record[0]["timeout"] == 40.0
+    client.get_updates(timeout=5)
+    assert record[1]["timeout"] == 30.0  # client default wins when larger
+
+
+def test_get_updates_explicit_client_timeout_wins():
+    record: list = []
+    client = TelegramClient(
+        FAKE_TOKEN, timeout=30.0, transport=_updates_transport([], record)
+    )
+    client.get_updates(timeout=30, client_timeout=3.0)
+    assert record[0]["timeout"] == 3.0
+
+
+@pytest.mark.parametrize("bad", [-1, 61, 100, "30", None, True])
+def test_get_updates_rejects_bad_poll_timeout(bad):
+    calls: list = []
+    client = TelegramClient(FAKE_TOKEN, transport=_updates_transport([], calls))
+    with pytest.raises(ValueError):
+        client.get_updates(timeout=bad)
+    assert calls == []
+
+
+@pytest.mark.parametrize("edge", [0, 60])
+def test_get_updates_accepts_poll_timeout_boundaries(edge):
+    client = TelegramClient(FAKE_TOKEN, transport=_updates_transport([]))
+    assert client.get_updates(timeout=edge) == []
+
+
+@pytest.mark.parametrize("bad", [-1, "41", 4.5, True])
+def test_get_updates_rejects_bad_offset(bad):
+    calls: list = []
+    client = TelegramClient(FAKE_TOKEN, transport=_updates_transport([], calls))
+    with pytest.raises(ValueError):
+        client.get_updates(offset=bad)
+    assert calls == []
+
+
+@pytest.mark.parametrize("bad", [0, -1, "x", True])
+def test_get_updates_rejects_bad_client_timeout(bad):
+    calls: list = []
+    client = TelegramClient(FAKE_TOKEN, transport=_updates_transport([], calls))
+    with pytest.raises(ValueError):
+        client.get_updates(client_timeout=bad)
+    assert calls == []
+
+
+def test_get_updates_non_list_result_is_permanent():
+    client = TelegramClient(
+        FAKE_TOKEN, transport=_updates_transport({"oops": True})
+    )
+    with pytest.raises(PermanentTelegramError):
+        client.get_updates()
+
+
+def test_get_updates_401_raises_authentication():
+    def fake(url, *, files, data, timeout):
+        return 401, {"ok": False, "error_code": 401, "description": "Unauthorized"}
+
+    with pytest.raises(AuthenticationError):
+        TelegramClient(FAKE_TOKEN, transport=fake).get_updates()
+
+
+def test_get_updates_never_leaks_token_shape_in_errors():
+    token_like = LEAK_SHAPE
+    client = TelegramClient(
+        FAKE_TOKEN,
+        transport=_updates_transport(
+            {"oops": True}, status=200,
+        ),
+    )
+    try:
+        client.get_updates()
+        raise AssertionError("expected PermanentTelegramError")
+    except PermanentTelegramError as exc:
+        assert token_like not in str(exc)
+        assert token_like not in repr(exc)

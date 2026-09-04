@@ -431,6 +431,68 @@ class TelegramClient:
             raise PermanentTelegramError("sendMediaGroup returned malformed data")
         return [int(m["message_id"]) for m in result]  # type: ignore[index]
 
+    def get_updates(
+        self,
+        offset: int | None = None,
+        timeout: int | float = 30,
+        *,
+        client_timeout: float | None = None,
+    ) -> list[dict]:
+        """Long-poll ``getUpdates``; return the RAW ``result`` list.
+
+        ``offset``/``timeout`` are passed through as Bot API params
+        (``timeout`` is the poll window in seconds, 0..60). Entries are
+        returned unparsed -- the receiver parses via
+        :func:`telegram.models.parse_update` and skips malformed entries
+        downstream.
+
+        HTTP timeout rule: long-polling holds the connection open for the
+        whole poll window, so the HTTP read timeout must be LONGER than
+        ``timeout``. The effective per-call HTTP timeout is the explicit
+        ``client_timeout`` override when given, else
+        ``max(self._timeout, timeout + 10)``.
+
+        Raises:
+            ValueError: If ``timeout`` is not in 0..60, ``offset`` is not
+                None/a non-negative int, or ``client_timeout`` is not a
+                positive number.
+        """
+        if (
+            not isinstance(timeout, (int, float))
+            or isinstance(timeout, bool)
+            or not 0 <= float(timeout) <= 60
+        ):
+            raise ValueError("timeout must be a number in 0..60 seconds")
+        if offset is not None and (
+            not isinstance(offset, int)
+            or isinstance(offset, bool)
+            or offset < 0
+        ):
+            raise ValueError("offset must be None or a non-negative int")
+        if client_timeout is not None:
+            try:
+                override = float(client_timeout)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "client_timeout must be a positive number of seconds"
+                ) from None
+            if isinstance(client_timeout, bool) or not override > 0:
+                raise ValueError(
+                    "client_timeout must be a positive number of seconds"
+                )
+            effective_timeout = override
+        else:
+            effective_timeout = max(self._timeout, float(timeout) + 10.0)
+        data: dict[str, Any] = {"timeout": timeout}
+        if offset is not None:
+            data["offset"] = offset
+        result = self._call(
+            "getUpdates", data=data, timeout=effective_timeout
+        )
+        if not isinstance(result, list):
+            raise PermanentTelegramError("getUpdates returned malformed data")
+        return result
+
     def send_message(
         self, chat_id: str, text: str, *, timeout: float | None = None
     ) -> SendMessageResult:

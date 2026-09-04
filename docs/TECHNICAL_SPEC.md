@@ -291,6 +291,75 @@ Use a local configuration file or OS-appropriate secret store abstraction. Do no
 
 For MVP, a local secret file with restrictive permissions is acceptable; implement a provider interface so OS keychain support can be added later.
 
+### 9.1 Remote-control settings (`settings` object)
+
+```jsonc
+{
+  "settings": {
+    "review_mode": false,          // default OFF; true = stage for approval
+    "admin_chat_ids": ["123"],     // explicit allowlist (strings, FR-002)
+    "comfy_host": "127.0.0.1",     // loopback only (save-time validated)
+    "comfy_port": 8188,
+    "triggers": [                  // default empty = /run runs nothing
+      {"name": "portrait", "prompt_file": "workflows/portrait_api.json"}
+    ]
+  }
+}
+```
+
+### 9.2 Bot commands
+
+| Command | Args | Effect | Reply |
+| --- | --- | --- | --- |
+| `/help` | — | list commands | command list |
+| `/status` | — | queue counts, worker state, most recent job | status block |
+| `/queue` | — | queued/sending jobs (caption preview 80 chars) | listing or "queue is empty" |
+| `/approve` | `<jobid>` | send staged payload once, mark `success` | `published to <dest>, message <id>` |
+| `/reject` | `<jobid>` | drop staged payload, mark `failed`/`Rejected` | `rejected publish to <dest>` |
+| `/run` | `<name>` | POST prompt file to local ComfyUI `/prompt` | `workflow started: <prompt_id>` |
+
+Unknown commands and non-command text get NO reply. Non-allowlisted
+chats get NO reply (warning log with chat id only). Handler failures
+return the fixed string `error processing command`.
+
+### 9.3 Review lifecycle (T063/T064)
+
+1. Node (both Send Image and Send Album) runs the normal pre-flight
+   (config resolution, duplicate check, encoding, caption rendering,
+   hashing). When `settings.review_mode` is true, it then stages
+   instead of sending: `history/review/<jobid>.png` holds the
+   first-frame PNG (job id = uuid4 hex), a `publish_jobs` row with
+   status `pending_review` (`attempts=0`) plus a `generations` row are
+   recorded best-effort, each admin id gets a `send_message`
+   notification (`New Telegram publish pending review from <dest>:
+   <caption80> — reply /approve <jobid> or /reject <jobid>`), and the
+   input IMAGE is returned with NO media sent. Review takes precedence
+   over `wait_for_upload=False` (ignored with an info log).
+2. `/approve <jobid>`: unknown/malformed id -> `unknown review job
+   '<arg>'`; non-pending row -> `already handled (status <s>)`;
+   missing payload -> row marked `failed`/`PayloadLost` +
+   `review payload missing; job marked failed`; otherwise the staged
+   bytes are sent via `sendPhoto` (filename = row filename or
+   `review_<id>.png`), the row moves to `success` with the message id,
+   the file is discarded, and the handler replies
+   `published to <dest>, message <id>`.
+3. `/reject <jobid>`: same lookup; a pending row moves to
+   `failed`/`Rejected`, the file is discarded (idempotent), reply
+   `rejected publish to <dest>`.
+
+### 9.4 Trigger contract (T065)
+
+`/run <name>` resolves `<name>` against `settings.triggers` (no match
+-> `unknown trigger '<name>'`, empty list ->
+`unknown trigger '<name>' (no triggers configured)`). The prompt file
+must exist, be a regular file, and be at most 5 MB
+(`trigger misconfigured: ...` otherwise); it must hold JSON, posted as
+`{"prompt": <parsed>}` via stdlib `urllib` to
+`http://<comfy_host>:<comfy_port>/prompt` (timeout 30 s, loopback
+re-validated at call time). The response must hold `prompt_id`
+(`workflow started: <prompt_id>`); every transport/parse failure maps
+to `trigger failed: <actionable>` with no tokens or tracebacks.
+
 ## 10. Error model
 
 ```text

@@ -237,9 +237,31 @@ Per `docs/SECURITY.md` and `docs/PRD.md` FR-001 / section 10 (risks):
 - If a token ever leaks (committed, posted, screenshotted): talk to
   `@BotFather`, send `/revoke`, and replace the token immediately.
 
-## 9. What exists vs. what is upcoming
+## 9. Enabling remote control (review mode + bot commands + triggers)
 
-| Item | Status |
+All remote control is OFF unless explicitly configured (see
+`docs/SECURITY.md` for the full contract).
+
+1. **Admin ids.** Message your bot, resolve your numeric chat id (section
+   4), and put it in the config `settings` object:
+   `"admin_chat_ids": ["<PASTE_CHAT_ID_HERE>"]`. Only these chats are
+   ever answered; an empty list answers nobody.
+2. **Review mode.** Set `"review_mode": true` to stage publishes for
+   approval instead of sending immediately. Admins then release each
+   image with `/approve <jobid>` or drop it with `/reject <jobid>`.
+   Staged payloads live under `<extension>/history/review/`.
+3. **Command list.** `/help`, `/status`, `/queue` (read-only);
+   `/approve <jobid>`, `/reject <jobid>` (review); `/run <name>`
+   (trigger a local workflow, see next step).
+4. **Trigger setup.** Add a named trigger pointing at a ComfyUI API
+   prompt file (JSON, at most 5 MB):
+   `"triggers": [{"name": "portrait",
+   "prompt_file": "<ABSOLUTE_PATH_TO_PROMPT_JSON>"}]`, then run it from
+   chat with `/run portrait`. Triggers only ever POST to loopback
+   (`comfy_host` must be `127.0.0.1`, `localhost`, or `::1`;
+   `comfy_port` defaults to `8188`).
+
+## 10. What exists vs. what is upcoming| Item | Status |
 | --- | --- |
 | Scaffold + registration (`__init__.py`, `publisher_nodes/__init__.py`) | Exists |
 | Dependency declarations (`pyproject.toml`, `requirements.txt`, Pillow, numpy) | Exist |

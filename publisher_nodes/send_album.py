@@ -33,6 +33,15 @@ Decisions:
   persisted ``publish_jobs`` row to ``success``/``failed``. Validation,
   duplicate, and caption errors still raise synchronously on the
   background path (fail fast before enqueue).
+- Review mode (``settings.review_mode``, T063, OFF by default): when
+  enabled, the node runs the same pre-flight, stores the FIRST frame's
+  PNG bytes as the review payload, records a ``pending_review`` job row
+  plus a generation row (best-effort history), notifies each admin via
+  ``send_message`` (best-effort), and returns the input batch WITHOUT
+  sending media. Review takes precedence over ``wait_for_upload=False``
+  (ignored with an info log: review is inherently deferred). A
+  settings-read failure warns and falls back to NORMAL publish
+  (fail-open).
 - History (one success ``publish_jobs`` row with the first-frame hash and
   comma-joined message ids, plus one ``generations`` row) is lazy and
   best-effort: any history failure logs a warning and the publish still
@@ -57,6 +66,8 @@ from publisher_nodes.send_image import (
     _destination_options,
     _history_repos,
     _record_generation,
+    _review_enabled,
+    _store_review,
     _DEFAULT_CONFIG_PATH,
     _DEFAULT_HISTORY_PATH,
     _DEFAULT_SECRET_PATH,
@@ -212,6 +223,28 @@ class TelegramSendAlbum:
                 f"sendMediaGroup needs 2-10 items; got {count} — use "
                 "Telegram Send Image for single frames."
             )
+        review_on, admin_ids = _review_enabled(self._config_store)
+        if review_on:
+            return self._publish_review(
+                frames,
+                images,
+                account,
+                destination,
+                caption=caption,
+                format=format,
+                quality=quality,
+                skip_duplicate=skip_duplicate,
+                wait_for_upload=wait_for_upload,
+                admin_ids=admin_ids,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                seed=seed,
+                steps=steps,
+                cfg=cfg,
+                sampler=sampler,
+                scheduler=scheduler,
+                model=model,
+            )
         if not wait_for_upload:
             return self._publish_background(
                 frames,
@@ -366,6 +399,159 @@ class TelegramSendAlbum:
             destination,
             count,
             elapsed_ms,
+        )
+        return (images,)
+
+    def _publish_review(
+        self,
+        frames: list[Any],
+        images: Any,
+        account: str,
+        destination: str,
+        caption: str = "",
+        format: str = "png",
+        quality: int = 90,
+        skip_duplicate: bool = False,
+        wait_for_upload: bool = True,
+        admin_ids: tuple[str, ...] = (),
+        prompt: str = "",
+        negative_prompt: str = "",
+        seed: str = "",
+        steps: str = "",
+        cfg: str = "",
+        sampler: str = "",
+        scheduler: str = "",
+        model: str = "",
+    ) -> tuple[Any, ...]:
+        """Stage an album for admin review; return IMAGE unchanged.
+
+        ``frames`` are pre-validated (2-10 items) by :meth:`publish`.
+        Runs the SAME pre-flight as the synchronous path (config
+        resolution, per-frame duplicate check, encoding, caption
+        rendering, hashing), stores the FIRST frame's bytes as the
+        review payload, and returns WITHOUT sending media. Review is
+        inherently deferred, so ``wait_for_upload=False`` is ignored
+        here (info log).
+        """
+        count = len(frames)
+        if not wait_for_upload:
+            _logger.info(
+                "telegram review mode: wait_for_upload=False is ignored;"
+                " publish is deferred until approval"
+            )
+        _logger.info(
+            "telegram album publish review start account=%s destination=%s"
+            " frames=%s format=%s quality=%s",
+            account,
+            destination,
+            count,
+            format,
+            quality,
+        )
+        hashes: list[str] = []
+        filename: str | None = None
+        caption_text = ""
+        try:
+            dest = self._config_store.get_destination(destination)
+            acct = self._config_store.get_account(account)
+            if dest.account_id != acct.id:
+                raise ConfigurationError(
+                    f"destination '{destination}' belongs to account "
+                    f"'{dest.account_id}', not '{account}'; refusing to "
+                    f"publish with the wrong account's token."
+                )
+            encoded_frames = [
+                encode_image(frame, format=format, quality=quality)
+                for frame in frames
+            ]
+            first = encoded_frames[0]
+            filename = f"comfyui_{first.width}x{first.height}.{first.format}"
+            metadata = GenerationMetadata.from_mapping(
+                {
+                    "prompt": prompt,
+                    "negative_prompt": negative_prompt,
+                    "seed": seed,
+                    "steps": steps,
+                    "cfg": cfg,
+                    "sampler": sampler,
+                    "scheduler": scheduler,
+                    "model": model,
+                    "width": first.width,
+                    "height": first.height,
+                    "filename": filename,
+                }
+            )
+            rendered = render_caption(caption, metadata.as_template_vars())
+            caption_text = rendered.text
+            for warning in rendered.warnings:
+                _logger.warning("telegram caption warning: %s", warning)
+            hashes = [sha256_hex(item.data) for item in encoded_frames]
+            if skip_duplicate:
+                # First hit refuses the WHOLE album before staging.
+                # Fail-open on DB trouble; only DuplicateError refuses.
+                repos = _history_repos(self._db_path)
+                if repos is not None:
+                    job_repo, _ = repos
+                    detector = DuplicateDetector(job_repo)
+                    try:
+                        for image_hash in hashes:
+                            detector.check(image_hash, dest.id)
+                    except DuplicateError:
+                        raise
+                    except Exception as exc:
+                        _logger.warning(
+                            "telegram duplicate check failed; proceeding: %s",
+                            exc,
+                        )
+            job_id = _store_review(
+                self._config_store,
+                self._secret_store,
+                self._client_factory,
+                self._db_path,
+                dest=dest,
+                acct=acct,
+                first_frame_bytes=bytes(first.data),
+                filename=filename,
+                image_hash=hashes[0],
+                caption_text=caption_text,
+                metadata=metadata,
+                admin_ids=admin_ids,
+            )
+        except Exception as exc:
+            try:
+                repos = _history_repos(self._db_path)
+                if repos is not None:
+                    job_repo, _ = repos
+                    job_repo.create(
+                        PublishJob(
+                            destination_id=destination,
+                            status="failed",
+                            image_hash=hashes[0] if hashes else None,
+                            filename=filename,
+                            caption=caption_text,
+                            attempts=0,
+                            error_code=type(exc).__name__,
+                            error_message=str(exc),
+                        )
+                    )
+            except Exception as history_exc:
+                _logger.warning("telegram history write failed: %s", history_exc)
+            message = f"Telegram publish failed: {friendly_message(exc, action='publish')}"
+            _logger.error(
+                "telegram album publish review failed account=%s destination=%s"
+                " error=%s",
+                account,
+                destination,
+                message,
+            )
+            raise RuntimeError(message) from exc
+        _logger.info(
+            "telegram album publish pending review job_id=%s account=%s"
+            " destination=%s frames=%s",
+            job_id,
+            account,
+            destination,
+            count,
         )
         return (images,)
 

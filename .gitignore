@@ -11,4 +11,5 @@ venv/
 *.sqlite3
 user_config/
 secrets/
+history/
 .DS_Store

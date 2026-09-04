@@ -45,6 +45,46 @@ class Destination:
 
 
 # ---------------------------------------------------------------------------
+# Bot settings (T060 remote-control configuration)
+# ---------------------------------------------------------------------------
+
+#: Hosts a command-triggered HTTP call is allowed to target. Command
+#: handlers (e.g. a future ``/run`` trigger) must never aim at remote
+#: hosts from a config file; only loopback is accepted.
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+@dataclass
+class Trigger:
+    """A named remote-workflow trigger (resolved at ``/run`` time)."""
+
+    name: str
+    prompt_file: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("trigger.name must be a non-empty string")
+        if not isinstance(self.prompt_file, str) or not self.prompt_file.strip():
+            raise ValueError("trigger.prompt_file must be a non-empty string")
+
+
+@dataclass
+class BotSettings:
+    """Remote-control settings (top-level ``"settings"`` object in config).
+
+    ``admin_chat_ids`` is the explicit admin allowlist (FR-002 strings);
+    ``comfy_host`` must stay loopback so command-triggered HTTP can never
+    be aimed at remote hosts via a config file.
+    """
+
+    review_mode: bool = False
+    admin_chat_ids: tuple[str, ...] = ()
+    comfy_host: str = "127.0.0.1"
+    comfy_port: int = 8188
+    triggers: tuple[Trigger, ...] = ()
+
+
+# ---------------------------------------------------------------------------
 # Secret store abstraction
 # ---------------------------------------------------------------------------
 
@@ -154,6 +194,7 @@ class ConfigStore:
         self._path = Path(config_path)
         self._accounts: dict[str, Account] = {}
         self._destinations: dict[str, Destination] = {}
+        self._settings: BotSettings = BotSettings()
         self._load()
 
     @property
@@ -242,6 +283,33 @@ class ConfigStore:
             for d in self._destinations.values()
         ]
 
+    # -- bot settings (T060) ----------------------------------------------
+
+    def get_settings(self) -> BotSettings:
+        """Return a copy of the remote-control settings (defaults if unset)."""
+        return BotSettings(
+            review_mode=self._settings.review_mode,
+            admin_chat_ids=tuple(self._settings.admin_chat_ids),
+            comfy_host=self._settings.comfy_host,
+            comfy_port=self._settings.comfy_port,
+            triggers=tuple(
+                Trigger(name=t.name, prompt_file=t.prompt_file)
+                for t in self._settings.triggers
+            ),
+        )
+
+    def save_settings(self, settings: BotSettings) -> BotSettings:
+        """Validate, persist, and return normalized bot settings.
+
+        Raises:
+            ValueError: If any field has the wrong type or an illegal value
+                (notably a non-loopback ``comfy_host``).
+        """
+        normalized = _normalize_settings(settings)
+        self._settings = normalized
+        self._save()
+        return self.get_settings()
+
     # -- token resolution -------------------------------------------------
 
     def resolve_token(self, account_id: str, secret_store: SecretStore) -> str:
@@ -257,6 +325,7 @@ class ConfigStore:
         if not self._path.exists():
             self._accounts = {}
             self._destinations = {}
+            self._settings = BotSettings()
             return
         try:
             raw = json.loads(self._path.read_text(encoding="utf-8"))
@@ -300,6 +369,7 @@ class ConfigStore:
             destinations[dest.id] = dest
         self._accounts = accounts
         self._destinations = destinations
+        self._settings = _settings_from_raw(raw.get("settings"), str(self._path))
 
     def _save(self) -> None:
         if self._path.parent != Path():
@@ -307,6 +377,7 @@ class ConfigStore:
         payload = {
             "accounts": [asdict(a) for a in self._accounts.values()],
             "destinations": [asdict(d) for d in self._destinations.values()],
+            "settings": _settings_to_dict(self._settings),
         }
         self._path.write_text(
             json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
@@ -363,3 +434,135 @@ def _destination_from_dict(entry: object, source: str) -> Destination:
     )
     _validate_destination(dest)
     return dest
+
+
+# ---------------------------------------------------------------------------
+# Bot settings helpers (T060)
+# ---------------------------------------------------------------------------
+
+_SETTINGS_KEYS = frozenset(
+    {"review_mode", "admin_chat_ids", "comfy_host", "comfy_port", "triggers"}
+)
+
+
+def _validate_admin_ids(value: object) -> tuple[str, ...]:
+    if not isinstance(value, (tuple, list)):
+        raise ValueError("admin_chat_ids must be a list of non-empty strings")
+    ids: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str) or not entry.strip():
+            raise ValueError("admin_chat_ids entries must be non-empty strings")
+        ids.append(entry)
+    return tuple(ids)
+
+
+def _validate_comfy_host(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("comfy_host must be a non-empty string")
+    host = value.strip()
+    if host not in LOOPBACK_HOSTS:
+        raise ValueError(
+            f"comfy_host must be loopback {sorted(LOOPBACK_HOSTS)}; "
+            f"refusing '{host}'"
+        )
+    return host
+
+
+def _validate_comfy_port(value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError("comfy_port must be an int in 1..65535")
+    if not 1 <= value <= 65535:
+        raise ValueError("comfy_port must be an int in 1..65535")
+    return value
+
+
+def _validate_triggers(value: object) -> tuple[Trigger, ...]:
+    if not isinstance(value, (tuple, list)):
+        raise ValueError("triggers must be a list of Trigger entries")
+    triggers: list[Trigger] = []
+    seen: set[str] = set()
+    for entry in value:
+        if not isinstance(entry, Trigger):
+            raise ValueError("triggers entries must be Trigger instances")
+        # Trigger.__post_init__ already enforces non-empty name/prompt_file.
+        if entry.name in seen:
+            raise ValueError(
+                f"duplicate trigger name '{entry.name}' (names must be unique)"
+            )
+        seen.add(entry.name)
+        triggers.append(
+            Trigger(name=entry.name, prompt_file=entry.prompt_file)
+        )
+    return tuple(triggers)
+
+
+def _normalize_settings(settings: BotSettings) -> BotSettings:
+    """Validate ``settings`` and return a normalized copy (tuples, copies)."""
+    if not isinstance(settings, BotSettings):
+        raise ValueError("settings must be a BotSettings instance")
+    if not isinstance(settings.review_mode, bool):
+        raise ValueError("review_mode must be a bool")
+    return BotSettings(
+        review_mode=settings.review_mode,
+        admin_chat_ids=_validate_admin_ids(settings.admin_chat_ids),
+        comfy_host=_validate_comfy_host(settings.comfy_host),
+        comfy_port=_validate_comfy_port(settings.comfy_port),
+        triggers=_validate_triggers(settings.triggers),
+    )
+
+
+def _settings_from_raw(raw: object, source: str) -> BotSettings:
+    """Parse the top-level ``"settings"`` object; absent -> defaults."""
+    if raw is None:
+        return BotSettings()
+    if not isinstance(raw, dict):
+        raise ValueError(f"config file '{source}': 'settings' must be an object")
+    unknown = set(raw.keys()) - _SETTINGS_KEYS
+    if unknown:
+        raise ValueError(
+            f"config file '{source}': unknown settings key(s) "
+            f"{sorted(str(k) for k in unknown)}"
+        )
+    triggers_raw = raw.get("triggers", ())
+    if not isinstance(triggers_raw, (tuple, list)):
+        raise ValueError(f"config file '{source}': 'triggers' must be a list")
+    triggers: list[Trigger] = []
+    for entry in triggers_raw:
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"config file '{source}': trigger entries must be objects"
+            )
+        unknown_t = set(entry.keys()) - {"name", "prompt_file"}
+        if unknown_t:
+            raise ValueError(
+                f"config file '{source}': unknown trigger key(s) "
+                f"{sorted(str(k) for k in unknown_t)}"
+            )
+        triggers.append(
+            Trigger(
+                name=entry.get("name", ""),  # type: ignore[arg-type]
+                prompt_file=entry.get("prompt_file", ""),  # type: ignore[arg-type]
+            )
+        )
+    return _normalize_settings(
+        BotSettings(
+            review_mode=raw.get("review_mode", False),  # type: ignore[arg-type]
+            admin_chat_ids=raw.get("admin_chat_ids", ()),  # type: ignore[arg-type]
+            comfy_host=raw.get("comfy_host", "127.0.0.1"),  # type: ignore[arg-type]
+            comfy_port=raw.get("comfy_port", 8188),  # type: ignore[arg-type]
+            triggers=triggers,  # type: ignore[arg-type]
+        )
+    )
+
+
+def _settings_to_dict(settings: BotSettings) -> dict:
+    return {
+        "review_mode": settings.review_mode,
+        "admin_chat_ids": list(settings.admin_chat_ids),
+        "comfy_host": settings.comfy_host,
+        "comfy_port": settings.comfy_port,
+        "triggers": [
+            {"name": t.name, "prompt_file": t.prompt_file}
+            for t in settings.triggers
+        ],
+    }

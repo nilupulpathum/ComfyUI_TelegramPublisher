@@ -26,6 +26,19 @@ Decisions:
   to the destination via :class:`services.dedup.DuplicateDetector` (live
   since T034). A hit refuses the publish loudly. A duplicate-lookup DB
   failure is fail-open: logged as a warning, publish proceeds.
+- Review mode (``settings.review_mode``, T063, OFF by default): when
+  enabled, the node runs the same pre-flight (config resolution,
+  duplicate check, encoding, caption rendering, hashing), stores the
+  first-frame PNG bytes under ``history/review/<jobid>.png`` via
+  :class:`services.review.ReviewStore`, records a ``pending_review``
+  job row plus a generation row (best-effort: history failures warn and
+  the review still proceeds), notifies each admin chat id via
+  ``send_message`` (best-effort per admin, never fatal), and returns
+  the input IMAGE WITHOUT sending media. Review is inherently
+  deferred, so ``wait_for_upload=False`` is ignored on this path (info
+  log). A settings-read failure warns and falls back to NORMAL publish
+  (fail-open, documented). Admins later release the image with
+  ``/approve <jobid>`` or drop it with ``/reject <jobid>`` (T064).
 - History (SQLite ``publish_jobs`` + ``generations``) is lazy and
   best-effort: the database is opened and ``init_schema()`` runs on first
   use inside try/except; any history failure logs a warning and the
@@ -39,6 +52,7 @@ Decisions:
 from __future__ import annotations
 
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
@@ -48,6 +62,7 @@ from services.dedup import DuplicateDetector, sha256_hex
 from services.encoder import encode_image
 from services.metadata import GenerationMetadata
 from services.queue import PublishPayload, PublishQueue, get_shared_queue
+from services.review import ReviewStore, review_dir_for
 from storage.config import ConfigStore, FileSecretStore
 from storage.database import Database
 from storage.repositories import (
@@ -262,6 +277,118 @@ def _record_generation(
     )
 
 
+def _review_enabled(
+    config_store: ConfigStore,
+) -> tuple[bool, tuple[str, ...]]:
+    """Best-effort review-mode flag plus admin ids (T063).
+
+    A settings-read failure warns and reports review OFF so publishing
+    falls back to the normal path (fail-open, documented).
+    """
+    try:
+        settings = config_store.get_settings()
+    except Exception as exc:
+        _logger.warning(
+            "telegram settings read failed; continuing with normal publish: %s",
+            exc,
+        )
+        return False, ()
+    try:
+        return bool(settings.review_mode), tuple(settings.admin_chat_ids)
+    except Exception as exc:
+        _logger.warning(
+            "telegram settings read failed; continuing with normal publish: %s",
+            exc,
+        )
+        return False, ()
+
+
+def _notify_review(
+    client: Any,
+    admin_ids: tuple[str, ...],
+    dest_name: str,
+    caption_text: str,
+    job_id: str,
+) -> None:
+    """Notify each admin of a pending review (best-effort per admin).
+
+    Individual send failures are logged and never fatal. The message
+    carries status/ids plus at most the first 80 chars of the caption;
+    never tokens, bytes, or tracebacks.
+    """
+    preview = caption_text[:80] if isinstance(caption_text, str) else ""
+    text = (
+        f"New Telegram publish pending review from {dest_name}: {preview}"
+        f" — reply /approve {job_id} or /reject {job_id}"
+    )
+    for admin_id in admin_ids:
+        try:
+            client.send_message(admin_id, text)
+        except Exception as exc:
+            _logger.warning(
+                "telegram review notify failed admin=%s error=%s",
+                admin_id,
+                type(exc).__name__,
+            )
+
+
+def _store_review(
+    config_store: ConfigStore,
+    secret_store: FileSecretStore,
+    client_factory: Callable[[str], TelegramClient],
+    db_path: Path,
+    *,
+    dest: Any,
+    acct: Any,
+    first_frame_bytes: bytes,
+    filename: str,
+    image_hash: str,
+    caption_text: str,
+    metadata: GenerationMetadata,
+    admin_ids: tuple[str, ...],
+) -> str:
+    """Persist a pending-review job and notify admins; send NO media.
+
+    Saves the first-frame PNG bytes under the review directory, records
+    a ``pending_review`` job row plus a generation row (history failures
+    warn and never block the review), then notifies each admin via
+    ``send_message`` (best-effort). Returns the new job id.
+
+    Raises:
+        ValueError: If the payload cannot be stored (empty / non-PNG /
+            oversize); the caller maps this to a failed publish.
+    """
+    job_id = uuid.uuid4().hex
+    store = ReviewStore(review_dir_for(db_path))
+    store.save(job_id, bytes(first_frame_bytes))
+    try:
+        repos = _history_repos(db_path)
+        if repos is not None:
+            job_repo, gen_repo = repos
+            job_repo.create(
+                PublishJob(
+                    id=job_id,
+                    destination_id=dest.id,
+                    status="pending_review",
+                    image_hash=image_hash,
+                    filename=filename,
+                    caption=caption_text,
+                    attempts=0,
+                )
+            )
+            _record_generation(gen_repo, job_id, metadata)
+    except Exception as exc:
+        _logger.warning("telegram history write failed: %s", exc)
+    try:
+        token = config_store.resolve_token(acct.id, secret_store)
+        client = client_factory(token)
+    except Exception as exc:
+        _logger.warning("telegram review notify unavailable: %s", exc)
+        return job_id
+    _notify_review(client, admin_ids, dest.name, caption_text, job_id)
+    return job_id
+
+
 class TelegramSendImage:
     """Publish one image to Telegram, passing IMAGE through unchanged."""
 
@@ -345,6 +472,29 @@ class TelegramSendImage:
         model: str = "",
     ) -> tuple[Any, ...]:
         """Send the first IMAGE frame to Telegram; return IMAGE unchanged."""
+        review_on, admin_ids = _review_enabled(self._config_store)
+        if review_on:
+            return self._publish_review(
+                image,
+                account,
+                destination,
+                caption=caption,
+                format=format,
+                quality=quality,
+                protect_content=protect_content,
+                disable_notification=disable_notification,
+                skip_duplicate=skip_duplicate,
+                wait_for_upload=wait_for_upload,
+                admin_ids=admin_ids,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                seed=seed,
+                steps=steps,
+                cfg=cfg,
+                sampler=sampler,
+                scheduler=scheduler,
+                model=model,
+            )
         if not wait_for_upload:
             return self._publish_background(
                 image,
@@ -492,6 +642,152 @@ class TelegramSendImage:
             account,
             destination,
             elapsed_ms,
+        )
+        return (image,)
+
+    def _publish_review(
+        self,
+        image: Any,
+        account: str,
+        destination: str,
+        caption: str = "",
+        format: str = "png",
+        quality: int = 90,
+        protect_content: bool = False,
+        disable_notification: bool = False,
+        skip_duplicate: bool = False,
+        wait_for_upload: bool = True,
+        admin_ids: tuple[str, ...] = (),
+        prompt: str = "",
+        negative_prompt: str = "",
+        seed: str = "",
+        steps: str = "",
+        cfg: str = "",
+        sampler: str = "",
+        scheduler: str = "",
+        model: str = "",
+    ) -> tuple[Any, ...]:
+        """Stage the first IMAGE frame for admin review; return IMAGE.
+
+        Runs the SAME pre-flight as the synchronous path (config
+        resolution, duplicate check, encoding, caption rendering,
+        hashing), stores the payload via :func:`_store_review`, and
+        returns WITHOUT sending media. Review is inherently deferred,
+        so ``wait_for_upload=False`` is ignored here (info log).
+        """
+        _ = (protect_content, disable_notification)  # Parity only; no send.
+        if not wait_for_upload:
+            _logger.info(
+                "telegram review mode: wait_for_upload=False is ignored;"
+                " publish is deferred until approval"
+            )
+        _logger.info(
+            "telegram publish review start account=%s destination=%s"
+            " format=%s quality=%s",
+            account,
+            destination,
+            format,
+            quality,
+        )
+        image_hash: str | None = None
+        filename: str | None = None
+        caption_text = ""
+        try:
+            dest = self._config_store.get_destination(destination)
+            acct = self._config_store.get_account(account)
+            if dest.account_id != acct.id:
+                raise ConfigurationError(
+                    f"destination '{destination}' belongs to account "
+                    f"'{dest.account_id}', not '{account}'; refusing to "
+                    f"publish with the wrong account's token."
+                )
+            frame = _first_frame(image)
+            encoded = encode_image(frame, format=format, quality=quality)
+            filename = f"comfyui_{encoded.width}x{encoded.height}.{encoded.format}"
+            metadata = GenerationMetadata.from_mapping(
+                {
+                    "prompt": prompt,
+                    "negative_prompt": negative_prompt,
+                    "seed": seed,
+                    "steps": steps,
+                    "cfg": cfg,
+                    "sampler": sampler,
+                    "scheduler": scheduler,
+                    "model": model,
+                    "width": encoded.width,
+                    "height": encoded.height,
+                    "filename": filename,
+                }
+            )
+            rendered = render_caption(caption, metadata.as_template_vars())
+            caption_text = rendered.text
+            for warning in rendered.warnings:
+                _logger.warning("telegram caption warning: %s", warning)
+            image_hash = sha256_hex(encoded.data)
+            if skip_duplicate:
+                # Fail-open like the sync path; only a positive
+                # DuplicateError refuses the publish.
+                repos = _history_repos(self._db_path)
+                if repos is not None:
+                    job_repo, _ = repos
+                    try:
+                        DuplicateDetector(job_repo).check(image_hash, dest.id)
+                    except DuplicateError:
+                        raise
+                    except Exception as exc:
+                        _logger.warning(
+                            "telegram duplicate check failed; proceeding: %s",
+                            exc,
+                        )
+            job_id = _store_review(
+                self._config_store,
+                self._secret_store,
+                self._client_factory,
+                self._db_path,
+                dest=dest,
+                acct=acct,
+                first_frame_bytes=bytes(encoded.data),
+                filename=filename,
+                image_hash=image_hash,
+                caption_text=caption_text,
+                metadata=metadata,
+                admin_ids=admin_ids,
+            )
+        except Exception as exc:
+            try:
+                repos = _history_repos(self._db_path)
+                if repos is not None:
+                    job_repo, _ = repos
+                    job_repo.create(
+                        PublishJob(
+                            destination_id=destination,
+                            status="failed",
+                            image_hash=image_hash,
+                            filename=filename,
+                            caption=caption_text,
+                            attempts=0,
+                            error_code=type(exc).__name__,
+                            error_message=str(exc),
+                        )
+                    )
+            except Exception as history_exc:
+                _logger.warning(
+                    "telegram history write failed: %s", history_exc
+                )
+            message = f"Telegram publish failed: {friendly_message(exc, action='publish')}"
+            _logger.error(
+                "telegram publish review failed account=%s destination=%s"
+                " error=%s",
+                account,
+                destination,
+                message,
+            )
+            raise RuntimeError(message) from exc
+        _logger.info(
+            "telegram publish pending review job_id=%s account=%s destination=%s",
+            job_id,
+            account,
+            destination,
         )
         return (image,)
 
