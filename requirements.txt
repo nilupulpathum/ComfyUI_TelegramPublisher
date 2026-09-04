@@ -1,0 +1,3 @@
+# Runtime dependencies (kept minimal; stdlib preferred elsewhere).
+# Pillow: IMAGE tensor -> PNG/JPEG encoding (T008).
+Pillow>=10

@@ -1,0 +1,76 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install package with test extras
+        run: pip install -e ".[test]"
+
+      - name: Run tests
+        run: python -m pytest tests/ -q
+
+      - name: Secret scan
+        shell: bash
+        run: |
+          python - <<'PYEOF'
+          import pathlib
+          import re
+          import sys
+
+          PATTERNS = [
+              r'[0-9]{8,10}:[A-Za-z0-9_-]{35}',  # Telegram bot token
+              r'verify\s*=\s*False',  # disabled TLS verification
+              r'-----BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY-----',  # private keys
+              r'(?i)(?:bot_token|api_key|password|passwd|secret)\s*=\s*[\'"][^\'"]+[\'"]',  # hardcoded secrets
+          ]
+
+          ROOTS = [
+              pathlib.Path('publisher_nodes'),
+              pathlib.Path('telegram'),
+              pathlib.Path('services'),
+              pathlib.Path('storage'),
+              pathlib.Path('web'),
+              pathlib.Path('__init__.py'),
+          ]
+
+          EXTENSIONS = {'.py', '.js'}
+
+          hits = []
+          for root in ROOTS:
+              if root.is_file():
+                  files = [root]
+              elif root.is_dir():
+                  files = sorted(p for p in root.rglob('*') if p.is_file() and p.suffix in EXTENSIONS)
+              else:
+                  continue
+              for path in files:
+                  text = path.read_text(encoding='utf-8', errors='ignore')
+                  for pattern in PATTERNS:
+                      for match in re.finditer(pattern, text):
+                          lineno = text.count('\n', 0, match.start()) + 1
+                          hits.append(str(path) + ':' + str(lineno) + ': matches ' + pattern)
+
+          for hit in hits:
+              print(hit)
+
+          if hits:
+              print('Secret scan FAILED: ' + str(len(hits)) + ' suspicious match(es).')
+              sys.exit(1)
+
+          print('Secret scan passed.')
+          PYEOF
