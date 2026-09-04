@@ -6,9 +6,10 @@ raw HTTP (all network goes through :class:`TelegramClient`).
 
 Decisions:
 
-- ``account`` / ``destination`` are plain STRING ids. Rich selector
-  widgets (account/destination dropdowns) are later-epic work (T051/T052);
-  until then users paste the ids from their local config.
+- ``account`` / ``destination`` are COMBO selectors whose options are
+  read fresh from the on-disk config on every INPUT_TYPES call (T051/T052,
+  ``""`` first = explicit unset); a restart picks up config edits made
+  outside ComfyUI. Publishing with ``""`` raises the actionable error.
 - ``wait_for_upload=True`` (default) publishes synchronously as before.
   ``wait_for_upload=False`` runs the SAME pre-flight (config resolution,
   duplicate check, encoding, caption rendering, hashing) and then
@@ -57,6 +58,7 @@ from storage.repositories import (
 )
 from telegram.client import TelegramClient
 from telegram.errors import ConfigurationError, DuplicateError
+from telegram.friendly import friendly_message
 from telegram.logging import get_logger
 
 # Extension dir derived from inside publisher_nodes/ (approved locations).
@@ -80,6 +82,43 @@ OPTIONAL_METADATA_INPUTS: dict[str, Any] = {
     "scheduler": ("STRING", {"default": "", "multiline": False}),
     "model": ("STRING", {"default": "", "multiline": False}),
 }
+
+
+def _combo_options(ids: list[str]) -> tuple[list[str]]:
+    """Build a ComfyUI COMBO spec from id strings: ``(["", ...sorted],)``.
+
+    Pure helper (T051/T052): ``""`` is always first (explicit unset;
+    publishing with ``""`` raises the existing actionable error) followed
+    by the sorted unique non-empty ids.
+    """
+    seen = sorted({item for item in ids if isinstance(item, str) and item})
+    return ([""] + seen,)
+
+
+def _account_options() -> tuple[list[str]]:
+    """COMBO options for ``account`` from the on-disk config (fresh read).
+
+    Falls back to ``([""],)`` when the config is missing/unreadable or
+    ``web_api`` is unavailable, so INPUT_TYPES never raises.
+    """
+    try:
+        from publisher_nodes.web_api import DEFAULT_CONFIG_PATH, account_ids
+
+        return _combo_options(account_ids(ConfigStore(DEFAULT_CONFIG_PATH)))
+    except Exception:
+        return ([""],)
+
+
+def _destination_options() -> tuple[list[str]]:
+    """COMBO options for ``destination`` from the on-disk config (fresh)."""
+    try:
+        from publisher_nodes.web_api import DEFAULT_CONFIG_PATH, destination_ids
+
+        return _combo_options(
+            destination_ids(ConfigStore(DEFAULT_CONFIG_PATH))
+        )
+    except Exception:
+        return ([""],)
 
 
 def _batch_size(image: Any) -> int | None:
@@ -271,8 +310,8 @@ class TelegramSendImage:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "account": ("STRING", {"default": ""}),
-                "destination": ("STRING", {"default": ""}),
+                "account": _account_options(),
+                "destination": _destination_options(),
                 "caption": ("STRING", {"multiline": True, "default": ""}),
                 "format": (["png", "jpeg"],),
                 "quality": ("INT", {"default": 90, "min": 1, "max": 100}),
@@ -439,7 +478,7 @@ class TelegramSendImage:
                 _logger.warning(
                     "telegram history write failed: %s", history_exc
                 )
-            message = f"Telegram publish failed: {exc}"
+            message = f"Telegram publish failed: {friendly_message(exc, action='publish')}"
             _logger.error(
                 "telegram publish failed account=%s destination=%s error=%s",
                 account,
@@ -582,7 +621,7 @@ class TelegramSendImage:
                 _logger.warning(
                     "telegram history write failed: %s", history_exc
                 )
-            message = f"Telegram publish failed: {exc}"
+            message = f"Telegram publish failed: {friendly_message(exc, action='publish')}"
             _logger.error(
                 "telegram publish background failed account=%s destination=%s"
                 " error=%s",

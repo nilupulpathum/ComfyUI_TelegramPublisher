@@ -130,6 +130,25 @@ def test_node_contract_attributes_and_input_keys():
     ]
 
 
+def test_account_destination_inputs_are_combos_with_unset_first():
+    # T051/T052: COMBO shape is a 1-tuple whose element is the options list,
+    # with "" first (explicit unset). INPUT_TYPES reads the repo DEFAULT
+    # paths (no user_config in the repo), so the fallback is ([""],).
+    required = TelegramSendImage.INPUT_TYPES()["required"]
+    for key in ("account", "destination"):
+        spec = required[key]
+        assert isinstance(spec, tuple) and len(spec) == 1
+        assert isinstance(spec[0], list)
+        assert spec[0] and spec[0][0] == ""
+
+
+def test_combo_options_helper_sorts_and_unsets_first():
+    from publisher_nodes.send_image import _combo_options
+
+    assert _combo_options([]) == ([""],)
+    assert _combo_options(["b", "a", "", "b"]) == (["", "a", "b"],)
+
+
 # ---------------------------------------------------------------------------
 # Happy paths
 # ---------------------------------------------------------------------------

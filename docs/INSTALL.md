@@ -4,9 +4,9 @@ Windows + ComfyUI Portable focused guide.
 
 > Scope note: Epic 1 (Foundation) is implemented — scaffold, registration,
 > Telegram client (T004–T006), local configuration (T007), image encoder
-> (T008), Send Image node (T009), sample workflow (T010), and this guide
-> (T011) all exist. The settings UI (T050), selectors (T051/T052), and
-> connection test (T053) are upcoming. Anything below that does not exist
+> (T008), Send Image node (T009), sample workflow (T010), the COMBO
+> selectors (T051/T052), the node buttons + HTTP API (T050/T053/T054), and
+> this guide (T011) all exist. Anything below that does not exist
 > yet is explicitly marked with its backlog ID from `tasks/BACKLOG.md`.
 
 ## 1. Prerequisites
@@ -132,11 +132,18 @@ the bot token is never persisted inside a workflow file.
   (secure local configuration). The exact file location and format are still
   to be defined by that task — do not create your own config file yet; any
   path you may see discussed elsewhere is not final until T007 lands.
-- The graphical settings UI is coming in **T050** (`web/settings.js` today is
-  only a one-line placeholder). There is currently no settings panel, no
-  account selector (T051), no destination selector (T052), and no connection
-  test button (T053) — do not look for them in the ComfyUI UI yet.
-- Until T007/T050 land, keep your token in your password manager and use
+- The node `account`/`destination` inputs are COMBO dropdowns (T051/T052):
+  options are read from the on-disk config each time the node is created,
+  with `""` first (explicit unset — publishing with `""` fails with an
+  actionable error telling you to pick a configured id). If you edit the
+  config file while ComfyUI is running, either press the node's
+  **Refresh Telegram lists** button (reloads the dropdowns in the browser)
+  or restart ComfyUI to pick the change up.
+- Each Telegram node carries two buttons (T050, `web/settings.js`): **Test
+  Telegram connection** (POSTs the currently selected account/destination
+  to `/telegram_publisher/test_connection` and `alert()`s the result) and
+  **Refresh Telegram lists** (re-fetches the dropdown options). Until T007
+  lands, keep your token in your password manager and use
   `<PASTE_TOKEN_HERE>` as the placeholder in any notes or drafts.
 
 ## 6. Run the sample workflow
@@ -245,7 +252,26 @@ Per `docs/SECURITY.md` and `docs/PRD.md` FR-001 / section 10 (risks):
 | Caption templates + metadata inputs | Exist (Epic 3) |
 | Local history (`history/publisher.sqlite3`) | Exists (Epic 3) |
 | Sample workflow JSON (`workflows/*.json`) | `basic_send_image.json` (T010), `send_album.json`, `metadata_caption.json` all exist |
-| Settings UI, selectors, connection test | Coming in T050–T053 |
+| Account/destination dropdowns (COMBO) | Exist (T051/T052) — `""` first = unset; restart ComfyUI or use Refresh to pick up config edits |
+| Node buttons: Test connection + Refresh lists | Exist (T050/T053) — see manual browser verification below |
+
+## 10. Manual browser verification (T050 frontend, ComfyUI frontend 1.x)
+
+The `web/settings.js` extension uses only long-standing frontend APIs, but
+frontend module paths vary by ComfyUI version, so verify by hand once:
+
+1. Start ComfyUI, open the browser, add a **Telegram Send Image** node.
+2. Confirm the `account`/`destination` widgets render as dropdowns and the
+   node shows **Test Telegram connection** and **Refresh Telegram lists**
+   buttons.
+3. Pick an account/destination, press **Test Telegram connection**, and
+   confirm the `alert()` reports OK (or an actionable error, never a token).
+4. Press **Refresh Telegram lists** and confirm the dropdowns reload.
+5. Open devtools → Network and confirm the calls hit
+   `GET /telegram_publisher/accounts`,
+   `GET /telegram_publisher/destinations`, and
+   `POST /telegram_publisher/test_connection` with no token in any
+   request or response body.
 
 Source of truth for status: `tasks/BACKLOG.md` together with
 `docs/PRD.md`, `docs/SECURITY.md`, and `docs/RELEASE_PLAN.md`

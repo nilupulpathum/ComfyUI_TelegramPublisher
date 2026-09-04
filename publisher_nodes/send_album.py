@@ -51,7 +51,10 @@ from typing import Any, Callable
 
 from publisher_nodes import register
 from publisher_nodes.send_image import (
+    _account_options,
+    _combo_options,
     _default_shared_queue,
+    _destination_options,
     _history_repos,
     _record_generation,
     _DEFAULT_CONFIG_PATH,
@@ -69,6 +72,7 @@ from storage.config import ConfigStore, FileSecretStore
 from storage.repositories import PublishJob
 from telegram.client import TelegramClient
 from telegram.errors import ConfigurationError, DuplicateError
+from telegram.friendly import friendly_message
 from telegram.logging import get_logger
 
 _logger = get_logger(__name__)
@@ -165,8 +169,8 @@ class TelegramSendAlbum:
         return {
             "required": {
                 "images": ("IMAGE",),
-                "account": ("STRING", {"default": ""}),
-                "destination": ("STRING", {"default": ""}),
+                "account": _account_options(),
+                "destination": _destination_options(),
                 "caption": ("STRING", {"multiline": True, "default": ""}),
                 "format": (["png", "jpeg"],),
                 "quality": ("INT", {"default": 90, "min": 1, "max": 100}),
@@ -347,7 +351,7 @@ class TelegramSendAlbum:
                     )
             except Exception as history_exc:
                 _logger.warning("telegram history write failed: %s", history_exc)
-            message = f"Telegram publish failed: {exc}"
+            message = f"Telegram publish failed: {friendly_message(exc, action='publish')}"
             _logger.error(
                 "telegram album publish failed account=%s destination=%s error=%s",
                 account,
@@ -500,7 +504,7 @@ class TelegramSendAlbum:
                     )
             except Exception as history_exc:
                 _logger.warning("telegram history write failed: %s", history_exc)
-            message = f"Telegram publish failed: {exc}"
+            message = f"Telegram publish failed: {friendly_message(exc, action='publish')}"
             _logger.error(
                 "telegram album publish background failed account=%s"
                 " destination=%s error=%s",

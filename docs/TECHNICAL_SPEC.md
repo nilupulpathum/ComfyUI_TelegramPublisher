@@ -160,8 +160,16 @@ created_at TEXT NOT NULL
 
 Inputs:
 - `image: IMAGE`
-- `account: configured account selector`
-- `destination: configured destination selector`
+- `account: COMBO selector of configured account ids` (options read fresh
+  from the on-disk config on every `INPUT_TYPES` call: `""` first =
+  explicit unset, then sorted account ids; publishing with `""` raises the
+  existing actionable error. Config edits made outside ComfyUI require a
+  ComfyUI restart to appear in the dropdown; the `web/settings.js`
+  extension additionally refreshes options live in the browser via
+  `GET /telegram_publisher/accounts` without a restart)
+- `destination: COMBO selector of configured destination ids` (same
+  semantics as `account`: `""` first, then sorted destination ids,
+  refreshed live via `GET /telegram_publisher/destinations`)
 - `caption: STRING` (caption template; see below)
 - `format: enum(png,jpeg)`
 - `quality: INT`
@@ -242,8 +250,13 @@ Inputs:
 - `images: IMAGE` (batch; must contain 2..10 frames — Telegram
   `sendMediaGroup` limits. Any other count is a `ValueError`; single
   frames belong to Telegram Send Image)
-- `account: configured account selector`
-- `destination: configured destination selector`
+- `account: COMBO selector of configured account ids` (`""` first =
+  explicit unset, then sorted ids; fresh read per `INPUT_TYPES` call, so a
+  ComfyUI restart picks up out-of-band config edits; live browser refresh
+  via `GET /telegram_publisher/accounts`)
+- `destination: COMBO selector of configured destination ids` (same
+  semantics; live browser refresh via
+  `GET /telegram_publisher/destinations`)
 - `caption: STRING` (caption template, rendered as for Send Image; the
   rendered text is attached to the first album item only)
 - `format: enum(png,jpeg)`

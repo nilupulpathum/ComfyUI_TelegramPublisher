@@ -130,6 +130,13 @@ def test_node_contract_attributes_and_input_keys():
     assert required["caption"] == ("STRING", {"multiline": True, "default": ""})
     assert required["format"] == (["png", "jpeg"],)
     assert required["quality"] == ("INT", {"default": 90, "min": 1, "max": 100})
+    # T051/T052: account/destination are COMBO selectors (1-tuple holding
+    # the options list, "" first = explicit unset), not free STRINGs.
+    for key in ("account", "destination"):
+        spec = required[key]
+        assert isinstance(spec, tuple) and len(spec) == 1
+        assert isinstance(spec[0], list)
+        assert spec[0] and spec[0][0] == ""
     optional = TelegramSendAlbum.INPUT_TYPES()["optional"]
     assert list(optional.keys()) == [
         "prompt",
@@ -141,6 +148,17 @@ def test_node_contract_attributes_and_input_keys():
         "scheduler",
         "model",
     ]
+
+
+def test_album_shares_combo_helper_with_send_image():
+    # T051/T052: the options builder is defined once in send_image and
+    # reused by send_album (no duplicated logic).
+    import publisher_nodes.send_album as album_mod
+    import publisher_nodes.send_image as image_mod
+
+    assert album_mod._combo_options is image_mod._combo_options
+    assert album_mod._account_options is image_mod._account_options
+    assert album_mod._destination_options is image_mod._destination_options
 
 
 def test_entry_import_exposes_both_nodes():
