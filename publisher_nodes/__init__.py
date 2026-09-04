@@ -38,6 +38,7 @@ __all__ = [
     "register",
     "TelegramSendImage",
     "TelegramSendAlbum",
+    "TelegramCommandPoller",
 ]
 
 
@@ -45,3 +46,4 @@ __all__ = [
 # Failures are loud by design (see module docstring).
 from .send_image import TelegramSendImage  # noqa: E402,F401
 from .send_album import TelegramSendAlbum  # noqa: E402,F401
+from .poll_commands import TelegramCommandPoller  # noqa: E402,F401

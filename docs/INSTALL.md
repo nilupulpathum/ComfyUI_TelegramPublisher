@@ -261,6 +261,22 @@ All remote control is OFF unless explicitly configured (see
    (`comfy_host` must be `127.0.0.1`, `localhost`, or `::1`;
    `comfy_port` defaults to `8188`).
 
+### Driving the bot: Telegram Command Poller node (T070)
+
+The commands above only answer while the **Telegram Command Poller**
+node runs — nothing polls in the background (by design, see
+`docs/SECURITY.md`).
+
+1. Set `admin_chat_ids` in the config `settings` object (step 1 above).
+2. Add the **Telegram Command Poller** node (Telegram category, output
+   node), pick the bot's `account`, and queue the prompt. Defaults poll
+   3 rounds of 10s each (worst case ~30s of blocking inside that run).
+3. DM the bot `/status` (or `/queue`, `/approve <jobid>`, ...). The node
+   returns `"<n> replies sent"` (or `"no new commands"` when there is
+   nothing new). With no admin chats configured it returns
+   `"Telegram polling skipped: ..."` without touching the network —
+   set `admin_chat_ids` and run again.
+
 ## 10. What exists vs. what is upcoming| Item | Status |
 | --- | --- |
 | Scaffold + registration (`__init__.py`, `publisher_nodes/__init__.py`) | Exists |

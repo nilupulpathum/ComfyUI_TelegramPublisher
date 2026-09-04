@@ -68,7 +68,7 @@ respond in a live install. Epic 7 wires a driver without violating the
 security stance (explicit user action, fail-closed allowlist, no
 background threads at import).
 
-- [ ] T070 Telegram Command Poller node — an explicit output node that
+- [x] T070 Telegram Command Poller node — an explicit output node that
   long-polls `getUpdates` while its prompt runs (account + poll count /
   timeout inputs), dispatches through the Epic 6 router, and returns
   without autostarting anything. Must work with ComfyUI execution

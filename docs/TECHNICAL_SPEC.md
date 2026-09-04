@@ -285,6 +285,50 @@ from the first frame/rendered text) plus one `generations` row; failures
 record a `failed` row best-effort, then raise. History failures never
 block publishing.
 
+### Telegram Command Poller
+
+Explicit Epic 7 driver for the section 9.2 bot commands: while its prompt
+runs, the node long-polls `getUpdates` and dispatches through the Epic 6
+router (`register_builtins` + `register_review`), then returns a STRING
+summary. No threads, no autostart, no module-level polling (the security
+stance is preserved: remote control stays off unless explicitly
+configured, and nothing in the extension polls without the user queueing
+this node).
+
+Inputs (no image inputs — this node drives the bot, it doesn't publish):
+- `account: COMBO selector of configured account ids` (same semantics
+  as the Send nodes: `""` first = explicit unset, then sorted ids, read
+  fresh from the on-disk config on every `INPUT_TYPES` call; polling
+  with `""` raises the existing actionable error)
+- `poll_rounds: INT` (default 3, min 1, max 20) — number of `getUpdates`
+  polls per run
+- `poll_timeout: INT` (default 10, min 1, max 30) — seconds per
+  `getUpdates` long-poll
+
+Output:
+- `STRING` summary, always a one-element tuple of `str`, never None:
+  `"<n> replies sent"`, `"no new commands"`, or the skip message.
+
+Blocking bound: worst case `poll_rounds x poll_timeout` seconds
+(default 3 x 10s = 30s). Each round is one `getUpdates` long-poll whose
+HTTP read timeout exceeds the poll window.
+
+Skip semantics: with no `admin_chat_ids` configured the node logs a
+warning and returns `Telegram polling skipped: no admin chats
+configured...` with ZERO network calls (fail-closed degrade: no client
+is built, no `getUpdates` is issued). An empty poll (no new commands)
+returns `no new commands` — not an error. Client/network failures raise
+`RuntimeError("Telegram polling failed: ...")` (chained, token-free,
+same contract as the publishers).
+
+Offset files: `<db parent>/offsets/<safe-account-id>.json` (next to
+`history/publisher.sqlite3`), where the account id is sanitized to
+`[A-Za-z0-9_-]` (other chars map to `"_"`). Sanitization collisions are
+harmless: approve/reject are idempotent and an offset rewind only
+reprocesses updates. The bot context passes `queue=None`, so `/status`
+reports `worker=off` while polling — starting the shared worker here
+would be a side effect beyond polling.
+
 ## 9. Configuration
 
 Use a local configuration file or OS-appropriate secret store abstraction. Do not put secrets in `NODE_CLASS_MAPPINGS`, serialized widget state, workflow templates, or README examples.
