@@ -1,12 +1,14 @@
-"""T009 tests: Telegram Send Image node. Fake transport only.
+"""T009 tests (+ Epic 3 integration): Telegram Send Image node.
 
-No real network, no real tokens (``TEST_TOKEN_xxx`` throughout), no
-ComfyUI import. Covers registration, happy path, failure mapping,
-skip_duplicate refusal, empty batches, and unknown ids.
+Fake transport only. No real network, no real tokens (``TEST_TOKEN_xxx``
+throughout), no ComfyUI import. Covers registration, happy path, failure
+mapping (RuntimeError, token-free), duplicate detection (live since T034),
+empty batches, unknown ids, caption templates, and history rows.
 """
 
 from __future__ import annotations
 
+import logging
 import socket
 import urllib.request
 from pathlib import Path
@@ -18,8 +20,9 @@ import pytest
 import publisher_nodes
 from publisher_nodes.send_image import TelegramSendImage
 from storage.config import Account, ConfigStore, Destination, FileSecretStore
+from storage.database import Database
+from storage.repositories import PublishJobRepository, GenerationRepository
 from telegram.client import TelegramClient
-from telegram.errors import ConfigurationError
 
 FAKE_TOKEN = "TEST_TOKEN_xxx"
 ACCOUNT_ID = "acc1"
@@ -66,8 +69,17 @@ def make_node(tmp_path: Path, transport: Any) -> TelegramSendImage:
         return TelegramClient(token, transport=transport)
 
     return TelegramSendImage(
-        config_store=config, secret_store=secrets, client_factory=factory
+        config_store=config,
+        secret_store=secrets,
+        client_factory=factory,
+        db_path=tmp_path / "history.sqlite3",
     )
+
+
+def repos_for(tmp_path: Path) -> tuple[PublishJobRepository, GenerationRepository]:
+    db = Database(tmp_path / "history.sqlite3")
+    db.init_schema()
+    return PublishJobRepository(db), GenerationRepository(db)
 
 
 def frame(h: int = 8, w: int = 8) -> np.ndarray:
@@ -104,6 +116,17 @@ def test_node_contract_attributes_and_input_keys():
         "disable_notification",
         "skip_duplicate",
         "wait_for_upload",
+    ]
+    optional = TelegramSendImage.INPUT_TYPES()["optional"]
+    assert list(optional.keys()) == [
+        "prompt",
+        "negative_prompt",
+        "seed",
+        "steps",
+        "cfg",
+        "sampler",
+        "scheduler",
+        "model",
     ]
 
 
@@ -195,16 +218,50 @@ def test_failed_upload_leaves_tensor_intact(tmp_path: Path):
     assert np.array_equal(batch, before)  # FR-004
 
 
-def test_skip_duplicate_refuses_loudly_without_network(tmp_path: Path):
+def test_failed_upload_records_failed_job_row(tmp_path: Path):
+    def bad_chat(url, *, files, data, timeout):
+        return 400, {"ok": False, "error_code": 400, "description": "bad chat"}
+
+    node = make_node(tmp_path, bad_chat)
+
+    with pytest.raises(RuntimeError):
+        node.publish(np.stack([frame()]), ACCOUNT_ID, DEST_ID)
+
+    job_repo, gen_repo = repos_for(tmp_path)
+    jobs = job_repo.list_recent()
+    assert len(jobs) == 1
+    assert jobs[0].status == "failed"
+    assert jobs[0].destination_id == DEST_ID
+    assert jobs[0].error_code
+    assert FAKE_TOKEN not in (jobs[0].error_message or "")
+    assert gen_repo.list_for_job(str(jobs[0].id)) == []
+
+
+def test_skip_duplicate_hit_refuses_without_resend(tmp_path: Path):
+    record: list = []
+    node = make_node(tmp_path, ok_transport(record))
+    batch = np.stack([frame()])
+
+    (result,) = node.publish(batch, ACCOUNT_ID, DEST_ID)
+    assert result is batch
+    assert len(record) == 1
+
+    with pytest.raises(RuntimeError, match="[Dd]uplicate"):
+        node.publish(batch, ACCOUNT_ID, DEST_ID, skip_duplicate=True)
+
+    assert len(record) == 1  # refusal made no second network call
+
+
+def test_skip_duplicate_miss_publishes(tmp_path: Path):
     record: list = []
     node = make_node(tmp_path, ok_transport(record))
 
-    with pytest.raises(ConfigurationError, match="T034"):
-        node.publish(
-            np.stack([frame()]), ACCOUNT_ID, DEST_ID, skip_duplicate=True
-        )
+    (result,) = node.publish(
+        np.stack([frame()]), ACCOUNT_ID, DEST_ID, skip_duplicate=True
+    )
 
-    assert record == []
+    assert len(record) == 1
+    assert result is not None
 
 
 def test_empty_batch_rejected(tmp_path: Path):
@@ -236,3 +293,96 @@ def test_unknown_account_id_raises_actionable_error(tmp_path: Path):
         node.publish(np.stack([frame()]), "ghost-acc", DEST_ID)
 
     assert record == []
+
+
+# ---------------------------------------------------------------------------
+# Epic 3: caption templates + history
+# ---------------------------------------------------------------------------
+
+
+def test_template_caption_rendered_and_sent(tmp_path: Path):
+    record: list = []
+    node = make_node(tmp_path, ok_transport(record))
+
+    node.publish(
+        np.stack([frame()]),
+        ACCOUNT_ID,
+        DEST_ID,
+        caption="{{prompt}} [{{seed}}]",
+        prompt="a cat",
+        seed="7",
+    )
+
+    assert record[0]["data"]["caption"] == "a cat [7]"
+    job_repo, _ = repos_for(tmp_path)
+    assert job_repo.list_recent()[0].caption == "a cat [7]"
+
+
+def test_unknown_caption_var_warns_but_sends(tmp_path: Path, caplog):
+    record: list = []
+    node = make_node(tmp_path, ok_transport(record))
+
+    with caplog.at_level(logging.WARNING):
+        node.publish(np.stack([frame()]), ACCOUNT_ID, DEST_ID, caption="x{{nope}}y")
+
+    assert record[0]["data"]["caption"] == "xy"
+    assert any("nope" in rec.getMessage() for rec in caplog.records)
+    assert FAKE_TOKEN not in caplog.text
+
+
+def test_success_writes_job_and_generation_rows(tmp_path: Path):
+    record: list = []
+    node = make_node(tmp_path, ok_transport(record))
+
+    node.publish(
+        np.stack([frame()]),
+        ACCOUNT_ID,
+        DEST_ID,
+        caption="hi",
+        prompt="a cat",
+        seed="7",
+        model="m",
+    )
+
+    job_repo, gen_repo = repos_for(tmp_path)
+    jobs = job_repo.list_recent()
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job.status == "success"
+    assert job.destination_id == DEST_ID
+    assert job.telegram_message_id == "42"
+    assert job.filename == "comfyui_8x8.png"
+    assert job.caption == "hi"
+    assert job.attempts == 1
+    assert job.image_hash
+    gens = gen_repo.list_for_job(str(job.id))
+    assert len(gens) == 1
+    assert gens[0].prompt == "a cat"
+    assert gens[0].seed == "7"
+    assert gens[0].model == "m"
+    assert gens[0].width == 8 and gens[0].height == 8
+
+
+def test_history_db_failure_still_publishes(tmp_path: Path):
+    record: list = []
+    config, secrets = make_stores(tmp_path)
+
+    def factory(token: str) -> TelegramClient:
+        assert token == FAKE_TOKEN
+        return TelegramClient(token, transport=ok_transport(record))
+
+    # A directory as db_path: SQLite cannot open it, so history warns
+    # and the publish must still succeed (fail-open).
+    node = TelegramSendImage(
+        config_store=config,
+        secret_store=secrets,
+        client_factory=factory,
+        db_path=tmp_path,
+    )
+
+    (result,) = node.publish(
+        np.stack([frame()]), ACCOUNT_ID, DEST_ID, skip_duplicate=True
+    )
+
+    assert len(record) == 1
+    assert result is not None

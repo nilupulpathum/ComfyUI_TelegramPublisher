@@ -162,7 +162,7 @@ Inputs:
 - `image: IMAGE`
 - `account: configured account selector`
 - `destination: configured destination selector`
-- `caption: STRING`
+- `caption: STRING` (caption template; see below)
 - `format: enum(png,jpeg)`
 - `quality: INT`
 - `protect_content: BOOLEAN`
@@ -170,10 +170,62 @@ Inputs:
 - `skip_duplicate: BOOLEAN`
 - `wait_for_upload: BOOLEAN`
 
+Optional metadata inputs (all `STRING`, default `""`; used for caption
+templates and history; `prompt`/`negative_prompt` use a multiline widget):
+- `prompt`, `negative_prompt`, `seed`, `steps`, `cfg`, `sampler`,
+  `scheduler`, `model`
+
 Output:
 - `IMAGE`
 
 The node should remain composable in a workflow.
+
+Side effects:
+- `caption` is rendered with `services.captions.render_caption` against
+  the metadata variables (section 4 plus `width`/`height`/`filename` from
+  the encoded frame). Unknown placeholders resolve to `""` with a logged
+  warning (fail-safe); the send proceeds.
+- The encoded payload's SHA-256 is computed. When `skip_duplicate` is
+  true, `services.dedup.DuplicateDetector` refuses the publish on a
+  destination-scoped success-history hit; a duplicate-lookup DB failure
+  warns and proceeds (fail-open).
+- History is lazy and best-effort (`history/publisher.sqlite3`): one
+  `publish_jobs` row (`success` with the Telegram message id, or `failed`
+  with `error_code`/`error_message`) plus one `generations` row. Any
+  history failure warns and never blocks publishing.
+
+### Telegram Send Album
+
+Inputs:
+- `images: IMAGE` (batch; must contain 2..10 frames — Telegram
+  `sendMediaGroup` limits. Any other count is a `ValueError`; single
+  frames belong to Telegram Send Image)
+- `account: configured account selector`
+- `destination: configured destination selector`
+- `caption: STRING` (caption template, rendered as for Send Image; the
+  rendered text is attached to the first album item only)
+- `format: enum(png,jpeg)`
+- `quality: INT`
+- `protect_content: BOOLEAN` (accepted for contract parity; currently not
+  forwarded by the `sendMediaGroup` wrapper)
+- `disable_notification: BOOLEAN` (accepted for contract parity; currently
+  not forwarded by the `sendMediaGroup` wrapper)
+- `skip_duplicate: BOOLEAN` (checks EVERY frame hash; the first hit
+  refuses the WHOLE album — no partial album is ever sent)
+- `wait_for_upload: BOOLEAN` (accepted; publishing is synchronous)
+
+Optional metadata inputs: same eight `STRING` inputs as Send Image
+(`prompt`, `negative_prompt`, `seed`, `steps`, `cfg`, `sampler`,
+`scheduler`, `model`).
+
+Output:
+- `IMAGE` (the input batch, unchanged)
+
+History: one success `publish_jobs` row (`image_hash` = first-frame hash,
+`telegram_message_id` = comma-joined message ids, `filename`/`caption`
+from the first frame/rendered text) plus one `generations` row; failures
+record a `failed` row best-effort, then raise. History failures never
+block publishing.
 
 ## 9. Configuration
 

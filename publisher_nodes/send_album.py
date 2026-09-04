@@ -1,32 +1,38 @@
-"""ComfyUI adapter: Telegram Send Image node (T009 + Epic 3 integration).
+"""ComfyUI adapter: Telegram Send Album node (T031 + Epic 3 integration).
 
 Node-layer only: adapts ComfyUI inputs/outputs to application services.
-No torch/ComfyUI imports here (passthrough needs no tensor ops) and no
-raw HTTP (all network goes through :class:`TelegramClient`).
+No torch/ComfyUI imports here (frame splitting is duck-typed in
+:mod:`services.batch`) and no raw HTTP (all network goes through
+:class:`TelegramClient`).
 
 Decisions:
 
-- ``account`` / ``destination`` are plain STRING ids. Rich selector
-  widgets (account/destination dropdowns) are later-epic work (T051/T052);
-  until then users paste the ids from their local config.
-- ``wait_for_upload`` is accepted per the node contract, but publishing is
-  always synchronous (ADR-005: the background queue is Epic 4), so the
-  flag currently does not change behavior.
-- ``caption`` is a template rendered with generation metadata
-  (``services.captions.render_caption``). Unknown placeholders resolve to
-  ``""`` with a logged warning (FR-009 fail-safe); the send proceeds.
-- ``skip_duplicate=True`` performs an exact-payload SHA-256 check scoped
-  to the destination via :class:`services.dedup.DuplicateDetector` (live
-  since T034). A hit refuses the publish loudly. A duplicate-lookup DB
-  failure is fail-open: logged as a warning, publish proceeds.
-- History (SQLite ``publish_jobs`` + ``generations``) is lazy and
-  best-effort: the database is opened and ``init_schema()`` runs on first
-  use inside try/except; any history failure logs a warning and the
-  publish continues (history NEVER blocks publishing).
-- Every other failure (config, encoding, Telegram API) surfaces as
-  ``RuntimeError`` carrying the typed error's actionable message. The bot
-  token is never interpolated into messages and the input IMAGE is always
-  returned untouched (FR-003 / FR-004).
+- ``images`` is a ComfyUI IMAGE batch; frames come from
+  :func:`services.batch.extract_frames` in order (frame 0 first, FR-005).
+- Telegram ``sendMediaGroup`` needs 2-10 items: any other frame count is
+  a fail-fast ``ValueError`` with an actionable message (use Telegram
+  Send Image for single frames). No history is written and no network is
+  touched for this validation failure.
+- Duplicate detection (``skip_duplicate=True``) checks EVERY frame hash
+  via :class:`services.dedup.DuplicateDetector`; the FIRST hit refuses the
+  WHOLE album loudly (no partial album is ever sent). The lookup is
+  fail-open: a DB failure warns and the publish proceeds.
+- ``caption`` is a template rendered with generation metadata (width,
+  height, and filename come from the FIRST encoded frame); the rendered
+  text goes on the first album item only (Telegram behavior).
+- ``protect_content`` / ``disable_notification`` / ``wait_for_upload``
+  are accepted for contract parity with Send Image, but the current
+  ``send_media_group`` wrapper does not expose per-send flags, so they
+  currently do not change behavior (like ``wait_for_upload`` on Send
+  Image, which always sends synchronously per ADR-005).
+- History (one success ``publish_jobs`` row with the first-frame hash and
+  comma-joined message ids, plus one ``generations`` row) is lazy and
+  best-effort: any history failure logs a warning and the publish still
+  succeeds (history NEVER blocks publishing).
+- Every send-path failure surfaces as ``RuntimeError`` carrying the typed
+  error's actionable message (chained). The bot token is never
+  interpolated into messages and the input IMAGE batch is always returned
+  untouched (FR-003 / FR-004).
 """
 
 from __future__ import annotations
@@ -36,123 +42,30 @@ from pathlib import Path
 from typing import Any, Callable
 
 from publisher_nodes import register
+from publisher_nodes.send_image import (
+    _history_repos,
+    _record_generation,
+    _DEFAULT_CONFIG_PATH,
+    _DEFAULT_HISTORY_PATH,
+    _DEFAULT_SECRET_PATH,
+    OPTIONAL_METADATA_INPUTS,
+)
+from services.batch import extract_frames
 from services.captions import render_caption
 from services.dedup import DuplicateDetector, sha256_hex
 from services.encoder import encode_image
 from services.metadata import GenerationMetadata
 from storage.config import ConfigStore, FileSecretStore
-from storage.database import Database
-from storage.repositories import (
-    Generation,
-    GenerationRepository,
-    PublishJob,
-    PublishJobRepository,
-)
+from storage.repositories import PublishJob
 from telegram.client import TelegramClient
 from telegram.errors import ConfigurationError, DuplicateError
 from telegram.logging import get_logger
 
-# Extension dir derived from inside publisher_nodes/ (approved locations).
-_EXTENSION_DIR = Path(__file__).resolve().parents[1]
-_DEFAULT_CONFIG_PATH = _EXTENSION_DIR / "user_config" / "accounts.json"
-_DEFAULT_SECRET_PATH = _EXTENSION_DIR / "secrets" / "tokens.json"
-_DEFAULT_HISTORY_PATH = _EXTENSION_DIR / "history" / "publisher.sqlite3"
-
 _logger = get_logger(__name__)
 
-#: Optional metadata inputs shared by the Send Image and Send Album nodes.
-#: ``prompt``/``negative_prompt`` use a multiline widget; the rest are
-#: single-line strings. All default to "" (absent metadata renders as "").
-OPTIONAL_METADATA_INPUTS: dict[str, Any] = {
-    "prompt": ("STRING", {"default": "", "multiline": True}),
-    "negative_prompt": ("STRING", {"default": "", "multiline": True}),
-    "seed": ("STRING", {"default": "", "multiline": False}),
-    "steps": ("STRING", {"default": "", "multiline": False}),
-    "cfg": ("STRING", {"default": "", "multiline": False}),
-    "sampler": ("STRING", {"default": "", "multiline": False}),
-    "scheduler": ("STRING", {"default": "", "multiline": False}),
-    "model": ("STRING", {"default": "", "multiline": False}),
-}
 
-
-def _batch_size(image: Any) -> int | None:
-    """Best-effort first-dim size for a batched IMAGE, else None."""
-    shape = getattr(image, "shape", None)
-    if shape is not None:
-        try:
-            return int(shape[0])
-        except (TypeError, IndexError, ValueError):
-            pass
-    try:
-        return len(image)  # type: ignore[arg-type]
-    except TypeError:
-        return None
-
-
-def _first_frame(image: Any) -> Any:
-    """Return the first frame of a batch, or the single frame itself.
-
-    Batch selection is deterministic: always frame 0 (FR-005). Empty
-    batches are rejected with an actionable error instead of sending
-    nothing or indexing blindly.
-    """
-    ndim = getattr(image, "ndim", None)
-    if ndim is None:
-        shape = getattr(image, "shape", None)
-        ndim = len(shape) if shape is not None else None
-    if ndim != 4:
-        # Single HWC frame (or an unknown layout that encode_image will
-        # validate and reject with its own actionable message).
-        return image
-    if _batch_size(image) == 0:
-        raise ValueError(
-            "empty image batch: IMAGE has 0 frames; nothing to publish."
-        )
-    return image[0]
-
-
-def _history_repos(
-    db_path: Path,
-) -> tuple[PublishJobRepository, GenerationRepository] | None:
-    """Open the history DB and return repos, or None (warn) on any failure.
-
-    Lazy + best-effort: ``init_schema()`` runs here on first use, and any
-    failure logs a warning so history NEVER blocks publishing.
-    """
-    try:
-        db = Database(db_path)
-        db.init_schema()
-        return PublishJobRepository(db), GenerationRepository(db)
-    except Exception as exc:
-        _logger.warning("telegram history unavailable: %s", exc)
-        return None
-
-
-def _record_generation(
-    gen_repo: GenerationRepository,
-    job_id: str,
-    metadata: GenerationMetadata,
-) -> None:
-    """Persist one generation row linked to a publish job."""
-    gen_repo.create(
-        Generation(
-            job_id=job_id,
-            prompt=metadata.prompt,
-            negative_prompt=metadata.negative_prompt,
-            model=metadata.model,
-            seed=metadata.seed,
-            steps=metadata.steps,
-            cfg=metadata.cfg,
-            sampler=metadata.sampler,
-            scheduler=metadata.scheduler,
-            width=metadata.width,
-            height=metadata.height,
-        )
-    )
-
-
-class TelegramSendImage:
-    """Publish one image to Telegram, passing IMAGE through unchanged."""
+class TelegramSendAlbum:
+    """Publish an IMAGE batch as a Telegram album; pass IMAGE through."""
 
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "publish"
@@ -186,7 +99,7 @@ class TelegramSendImage:
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "image": ("IMAGE",),
+                "images": ("IMAGE",),
                 "account": ("STRING", {"default": ""}),
                 "destination": ("STRING", {"default": ""}),
                 "caption": ("STRING", {"multiline": True, "default": ""}),
@@ -202,7 +115,7 @@ class TelegramSendImage:
 
     def publish(
         self,
-        image: Any,
+        images: Any,
         account: str,
         destination: str,
         caption: str = "",
@@ -221,19 +134,29 @@ class TelegramSendImage:
         scheduler: str = "",
         model: str = "",
     ) -> tuple[Any, ...]:
-        """Send the first IMAGE frame to Telegram; return IMAGE unchanged."""
+        """Send IMAGE frames as a Telegram media group; return IMAGE unchanged."""
         _ = wait_for_upload  # Contract flag; always sends synchronously.
+        _ = protect_content  # Accepted for contract parity; not forwarded
+        _ = disable_notification  # by the send_media_group wrapper (see docs).
+        # Fail-fast validation: no history, no network on bad input.
+        frames = extract_frames(images)
+        count = len(frames)
+        if count < 2 or count > 10:
+            raise ValueError(
+                f"sendMediaGroup needs 2-10 items; got {count} — use "
+                "Telegram Send Image for single frames."
+            )
         _logger.info(
-            "telegram publish start account=%s destination=%s format=%s quality=%s",
+            "telegram album publish start account=%s destination=%s frames=%s format=%s quality=%s",
             account,
             destination,
+            count,
             format,
             quality,
         )
         start = time.perf_counter()
-        # Best-effort history fields: filled as the publish proceeds so a
-        # failure can still record a failed job with what is known so far.
-        image_hash: str | None = None
+        # Best-effort history fields, filled as the publish proceeds.
+        hashes: list[str] = []
         filename: str | None = None
         caption_text = ""
         try:
@@ -247,9 +170,12 @@ class TelegramSendImage:
                 )
             # Local only; never stored on the node, logged, or put in errors.
             token = self._config_store.resolve_token(acct.id, self._secret_store)
-            frame = _first_frame(image)
-            encoded = encode_image(frame, format=format, quality=quality)
-            filename = f"comfyui_{encoded.width}x{encoded.height}.{encoded.format}"
+            encoded_frames = [
+                encode_image(frame, format=format, quality=quality)
+                for frame in frames
+            ]
+            first = encoded_frames[0]
+            filename = f"comfyui_{first.width}x{first.height}.{first.format}"
             metadata = GenerationMetadata.from_mapping(
                 {
                     "prompt": prompt,
@@ -260,8 +186,8 @@ class TelegramSendImage:
                     "sampler": sampler,
                     "scheduler": scheduler,
                     "model": model,
-                    "width": encoded.width,
-                    "height": encoded.height,
+                    "width": first.width,
+                    "height": first.height,
                     "filename": filename,
                 }
             )
@@ -269,15 +195,18 @@ class TelegramSendImage:
             caption_text = rendered.text
             for warning in rendered.warnings:
                 _logger.warning("telegram caption warning: %s", warning)
-            image_hash = sha256_hex(encoded.data)
+            hashes = [sha256_hex(item.data) for item in encoded_frames]
             if skip_duplicate:
-                # Fail-open: a broken duplicate lookup warns and proceeds;
-                # only a positive DuplicateError refuses the publish.
+                # First hit refuses the WHOLE album: no partial send.
+                # Fail-open on DB trouble (warn + proceed); only a
+                # positive DuplicateError refuses.
                 repos = _history_repos(self._db_path)
                 if repos is not None:
                     job_repo, _ = repos
+                    detector = DuplicateDetector(job_repo)
                     try:
-                        DuplicateDetector(job_repo).check(image_hash, dest.id)
+                        for image_hash in hashes:
+                            detector.check(image_hash, dest.id)
                     except DuplicateError:
                         raise
                     except Exception as exc:
@@ -286,13 +215,10 @@ class TelegramSendImage:
                             exc,
                         )
             client = self._client_factory(token)
-            result = client.send_photo(
+            message_ids = client.send_media_group(
                 dest.chat_id,
-                encoded.data,
-                filename,
+                [(item.data, filename) for item in encoded_frames],
                 caption_text or None,
-                protect_content=bool(protect_content),
-                disable_notification=bool(disable_notification),
             )
             try:
                 repos = _history_repos(self._db_path)
@@ -302,18 +228,20 @@ class TelegramSendImage:
                         PublishJob(
                             destination_id=dest.id,
                             status="success",
-                            image_hash=image_hash,
+                            image_hash=hashes[0],
                             filename=filename,
                             caption=caption_text,
                             attempts=1,
-                            telegram_message_id=str(result.message_id),
+                            telegram_message_id=",".join(
+                                str(mid) for mid in message_ids
+                            ),
                         )
                     )
                     _record_generation(gen_repo, str(job.id), metadata)
             except Exception as exc:
                 _logger.warning("telegram history write failed: %s", exc)
         except Exception as exc:
-            # Decision (a): every failure surfaces as RuntimeError with the
+            # Every send-path failure surfaces as RuntimeError with the
             # typed error's actionable message; the original is chained.
             # The token is never interpolated above, so it cannot leak here.
             try:
@@ -324,7 +252,7 @@ class TelegramSendImage:
                         PublishJob(
                             destination_id=destination,
                             status="failed",
-                            image_hash=image_hash,
+                            image_hash=hashes[0] if hashes else None,
                             filename=filename,
                             caption=caption_text,
                             attempts=1,
@@ -333,12 +261,10 @@ class TelegramSendImage:
                         )
                     )
             except Exception as history_exc:
-                _logger.warning(
-                    "telegram history write failed: %s", history_exc
-                )
+                _logger.warning("telegram history write failed: %s", history_exc)
             message = f"Telegram publish failed: {exc}"
             _logger.error(
-                "telegram publish failed account=%s destination=%s error=%s",
+                "telegram album publish failed account=%s destination=%s error=%s",
                 account,
                 destination,
                 message,
@@ -346,12 +272,13 @@ class TelegramSendImage:
             raise RuntimeError(message) from exc
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         _logger.info(
-            "telegram publish success account=%s destination=%s elapsed_ms=%.1f",
+            "telegram album publish success account=%s destination=%s frames=%s elapsed_ms=%.1f",
             account,
             destination,
+            count,
             elapsed_ms,
         )
-        return (image,)
+        return (images,)
 
 
-register(TelegramSendImage, "Telegram Send Image", "Telegram Send Image")
+register(TelegramSendAlbum, "Telegram Send Album", "Telegram Send Album")

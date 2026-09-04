@@ -76,9 +76,11 @@ ComfyUI Portable build first.
 
 5. Verify: ComfyUI should start with no import errors mentioning
    `ComfyUI-TelegramPublisher` or `__init__.py`. The extension registers
-   the **Telegram Send Image** node (T009) under the Telegram category.
+   the **Telegram Send Image** node (T009) and the **Telegram Send Album**
+   node (T031) under the Telegram category.
    So "installed correctly" means ComfyUI starts cleanly AND a
-   "Telegram Send Image" node appears in the Add Node menu.
+   "Telegram Send Image" node and a "Telegram Send Album" node appear in
+   the Add Node menu.
 
 ## 3. Create a bot via BotFather
 
@@ -145,8 +147,18 @@ needed) into the **Telegram Send Image** node (T009) with placeholder
 account/destination ids (`my-account`, `my-channel`) — replace those with
 your own configured ids before running; never put tokens in the file.
 
-- The other examples listed in `workflows/README.md` — `send_album.json`,
-  `metadata_caption.json` — are still planned, not present.
+- The other examples listed in `workflows/README.md` now also ship:
+  `send_album.json` (EmptyImage batch of 2 into **Telegram Send Album**,
+  T031) and `metadata_caption.json` (caption template `{{prompt}}` with
+  the optional metadata inputs filled in). Both use placeholder ids
+  (`my-account`, `my-channel`) — replace those with your own configured
+  ids before running; never put tokens in the files.
+
+Publish history is stored in a local SQLite file at
+`<extension>/history/publisher.sqlite3` (created automatically on first
+publish). Both nodes also accept optional metadata inputs (`prompt`,
+`negative_prompt`, `seed`, `steps`, `cfg`, `sampler`, `scheduler`,
+`model`) used for `{{placeholder}}` caption templates and history rows.
 
 The expected flow (per `docs/PRD.md` section 9) is: load the sample
 workflow → generate an image → publish it to the configured Telegram
@@ -156,8 +168,9 @@ failure messages.
 ## 7. Troubleshooting
 
 - **Extension does not appear / no Telegram nodes in the Add Node menu.**
-  The **Telegram Send Image** node (T009) should appear under the Telegram
-  category. If it is missing, or ComfyUI itself fails to start after
+  The **Telegram Send Image** node (T009) and **Telegram Send Album**
+  node (T031) should appear under the Telegram
+  category. If they are missing, or ComfyUI itself fails to start after
   copying the folder, check:
   1. The folder layout — `<...>\custom_nodes\ComfyUI-TelegramPublisher\__init__.py`
      must exist (root `__init__.py` is the ComfyUI entry point).
@@ -212,7 +225,10 @@ Per `docs/SECURITY.md` and `docs/PRD.md` FR-001 / section 10 (risks):
 | Local account configuration | Exists (T007) |
 | Image encoder (Pillow) | Exists (T008) |
 | Send Image node | Exists (T009) |
-| Sample workflow JSON (`workflows/*.json`) | `basic_send_image.json` exists (T010); `send_album`/`metadata_caption` still planned |
+| Send Album node (2–10 frame batches) | Exists (T031) |
+| Caption templates + metadata inputs | Exist (Epic 3) |
+| Local history (`history/publisher.sqlite3`) | Exists (Epic 3) |
+| Sample workflow JSON (`workflows/*.json`) | `basic_send_image.json` (T010), `send_album.json`, `metadata_caption.json` all exist |
 | Settings UI, selectors, connection test | Coming in T050–T053 |
 
 Source of truth for status: `tasks/BACKLOG.md` together with

@@ -26,13 +26,13 @@ Priority: P0 highest.
 
 ## Epic 3 — Publishing
 
-- [ ] T030 Implement batch extraction
-- [ ] T031 Implement Send Album node
-- [ ] T032 Add metadata extractor
-- [ ] T033 Add caption template engine
-- [ ] T034 Add duplicate detector
-- [ ] T035 Add SQLite history
-- [ ] T036 Persist Telegram message IDs
+- [x] T030 Implement batch extraction
+- [x] T031 Implement Send Album node
+- [x] T032 Add metadata extractor
+- [x] T033 Add caption template engine
+- [x] T034 Add duplicate detector
+- [x] T035 Add SQLite history
+- [x] T036 Persist Telegram message IDs
 
 ## Epic 4 — Queue
 
