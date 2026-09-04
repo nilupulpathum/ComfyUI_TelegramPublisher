@@ -168,7 +168,7 @@ Inputs:
 - `protect_content: BOOLEAN`
 - `disable_notification: BOOLEAN`
 - `skip_duplicate: BOOLEAN`
-- `wait_for_upload: BOOLEAN`
+- `wait_for_upload: BOOLEAN` (see "Background publishing" below)
 
 Optional metadata inputs (all `STRING`, default `""`; used for caption
 templates and history; `prompt`/`negative_prompt` use a multiline widget):
@@ -179,6 +179,48 @@ Output:
 - `IMAGE`
 
 The node should remain composable in a workflow.
+
+#### Background publishing (`wait_for_upload`, Epic 4)
+
+Both nodes share the same two modes:
+
+- `wait_for_upload=True` (default): synchronous. The node uploads
+  before returning; history gets one `publish_jobs` row (`success`
+  with the Telegram message id, or `failed` with
+  `error_code`/`error_message`) plus one `generations` row.
+- `wait_for_upload=False`: background. The node runs the SAME
+  pre-flight as the sync path (config resolution, duplicate check when
+  `skip_duplicate`, encoding, caption rendering with warnings,
+  SHA-256), builds a `services.queue.PublishPayload` whose `metadata`
+  dict is `GenerationMetadata.as_template_vars()` PLUS
+  `image_hash` (first-frame payload hash, the row's `image_hash`
+  source) and `filename` (first filename), enqueues it, logs
+  `job_id`/`account`/`destination`, and returns the input IMAGE(S)
+  immediately with NO network on the call. Validation, duplicate,
+  caption, and enqueue errors still raise synchronously (fail fast
+  before enqueue, wrapped as `RuntimeError` like the sync path, with a
+  best-effort `failed` history row at `attempts=0`).
+
+Background rows: `enqueue` persists a `queued` row first, then the
+worker uploads (single attempt per try; the WORKER owns all retries --
+the sender client is built with `retry_policy=None` so there is no
+double-retry layering, FR-008) and moves the row to `success` (with
+the sender's message-id string) or `failed` (`RetryExhausted` /
+`PayloadLost` / typed error name). Transient failures requeue with
+`next_retry_at = now + min(retry_after, max_delay)`; a worker that
+takes a not-yet-due job puts it back untouched and sleeps until due
+(capped at `poll_interval * 5`) instead of attempting early. No
+`generations` row is written for background jobs.
+
+Shared queue lifecycle: background publishes under both nodes go
+through `services.queue.get_shared_queue(str(history_db_path),
+factory)` -- one started process-wide queue per history database,
+created once and shut down by an `atexit` backstop
+(`_shutdown_shared_queues`) because ComfyUI has no extension-unload
+hook. Queue state is readable at any time via
+`PublishQueue.status()` (`queued`/`sending`/`success`/`failed` row
+counts, `worker_running`, `buffered`, `maxsize`); the node-level
+status indicator UI is Epic 5 T054.
 
 Side effects:
 - `caption` is rendered with `services.captions.render_caption` against
@@ -212,7 +254,10 @@ Inputs:
   not forwarded by the `sendMediaGroup` wrapper)
 - `skip_duplicate: BOOLEAN` (checks EVERY frame hash; the first hit
   refuses the WHOLE album — no partial album is ever sent)
-- `wait_for_upload: BOOLEAN` (accepted; publishing is synchronous)
+- `wait_for_upload: BOOLEAN` (see "Background publishing" above:
+  `False` enqueues an `album` payload with all files and returns
+  immediately; per-send `protect_content`/`disable_notification` are
+  carried but not forwarded by the `sendMediaGroup` wrapper)
 
 Optional metadata inputs: same eight `STRING` inputs as Send Image
 (`prompt`, `negative_prompt`, `seed`, `steps`, `cfg`, `sampler`,

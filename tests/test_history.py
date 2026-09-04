@@ -41,7 +41,7 @@ def test_schema_creates_tables_and_version_row(tmp_path):
             (SCHEMA_VERSION,),
         ).fetchone()
         assert version is not None
-        assert version["version"] == 1
+        assert version["version"] == SCHEMA_VERSION
 
 
 def test_init_schema_is_idempotent(tmp_path):
@@ -70,6 +70,7 @@ def test_publish_jobs_columns_match_spec(tmp_path):
         "telegram_message_id",
         "error_code",
         "error_message",
+        "next_retry_at",
         "created_at",
         "updated_at",
     }

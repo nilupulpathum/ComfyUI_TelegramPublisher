@@ -20,11 +20,19 @@ Decisions:
 - ``caption`` is a template rendered with generation metadata (width,
   height, and filename come from the FIRST encoded frame); the rendered
   text goes on the first album item only (Telegram behavior).
-- ``protect_content`` / ``disable_notification`` / ``wait_for_upload``
-  are accepted for contract parity with Send Image, but the current
-  ``send_media_group`` wrapper does not expose per-send flags, so they
-  currently do not change behavior (like ``wait_for_upload`` on Send
-  Image, which always sends synchronously per ADR-005).
+- ``protect_content`` / ``disable_notification`` are accepted for
+  contract parity with Send Image, but the ``sendMediaGroup`` wrapper
+  does not expose per-send flags, so they are carried on the payload
+  and ignored at send time (both paths).
+- ``wait_for_upload=True`` (default) publishes synchronously as before.
+  ``wait_for_upload=False`` runs the SAME pre-flight (frame-count
+  validation, config resolution, duplicate check, encoding, caption
+  rendering, hashing) and then enqueues an ``album`` payload on the
+  process-wide shared queue, returning the input batch immediately
+  without network. The background worker uploads later and moves the
+  persisted ``publish_jobs`` row to ``success``/``failed``. Validation,
+  duplicate, and caption errors still raise synchronously on the
+  background path (fail fast before enqueue).
 - History (one success ``publish_jobs`` row with the first-frame hash and
   comma-joined message ids, plus one ``generations`` row) is lazy and
   best-effort: any history failure logs a warning and the publish still
@@ -43,6 +51,7 @@ from typing import Any, Callable
 
 from publisher_nodes import register
 from publisher_nodes.send_image import (
+    _default_shared_queue,
     _history_repos,
     _record_generation,
     _DEFAULT_CONFIG_PATH,
@@ -55,6 +64,7 @@ from services.captions import render_caption
 from services.dedup import DuplicateDetector, sha256_hex
 from services.encoder import encode_image
 from services.metadata import GenerationMetadata
+from services.queue import PublishPayload, PublishQueue
 from storage.config import ConfigStore, FileSecretStore
 from storage.repositories import PublishJob
 from telegram.client import TelegramClient
@@ -62,6 +72,49 @@ from telegram.errors import ConfigurationError, DuplicateError
 from telegram.logging import get_logger
 
 _logger = get_logger(__name__)
+
+
+def _make_sender(
+    config_store: ConfigStore, secret_store: FileSecretStore
+) -> Callable[[PublishPayload], str]:
+    """Build the queue worker's sender: fresh token per job, one attempt.
+
+    Kept in this module (mirroring ``send_image._make_sender``) so node
+    dependencies stay explicit. The token is resolved FRESH on every
+    call (rotation-safe) and stays local: never stored, logged, or in
+    error text. Single attempt (``retry_policy=None``): the worker owns
+    retries (FR-008). Album dispatch uses ``send_media_group`` (caption
+    on the first item via the client); per-send ``protect_content`` /
+    ``disable_notification`` flags are not forwarded by that wrapper.
+    """
+
+    def sender(payload: PublishPayload) -> str:
+        token = config_store.resolve_token(payload.account_id, secret_store)
+        client = TelegramClient(token, retry_policy=None)
+        if payload.kind == "photo":
+            data, filename = payload.files[0]
+            result = client.send_photo(
+                payload.chat_id,
+                bytes(data),
+                filename,
+                payload.caption or None,
+                protect_content=bool(payload.protect_content),
+                disable_notification=bool(payload.disable_notification),
+            )
+            return str(result.message_id)
+        if payload.kind == "album":
+            message_ids = client.send_media_group(
+                payload.chat_id,
+                [
+                    (bytes(item_data), item_name)
+                    for item_data, item_name in payload.files
+                ],
+                payload.caption or None,
+            )
+            return ",".join(str(mid) for mid in message_ids)
+        raise ValueError(f"unknown payload kind {payload.kind!r}")
+
+    return sender
 
 
 class TelegramSendAlbum:
@@ -78,10 +131,11 @@ class TelegramSendAlbum:
         secret_store: FileSecretStore | None = None,
         client_factory: Callable[[str], TelegramClient] | None = None,
         db_path: str | Path | None = None,
+        queue_factory: Callable[[], PublishQueue] | None = None,
     ) -> None:
         # Injectable seams: tests pass tmp-path stores, a fake-transport
-        # factory, and a tmp db_path so no ComfyUI, network, real secrets,
-        # or repo files are ever needed.
+        # factory, a tmp db_path, and a fake queue_factory so no ComfyUI,
+        # network, real secrets, or repo files are ever needed.
         self._config_store = (
             config_store if config_store is not None else ConfigStore(_DEFAULT_CONFIG_PATH)
         )
@@ -94,6 +148,17 @@ class TelegramSendAlbum:
             client_factory if client_factory is not None else TelegramClient
         )
         self._db_path = Path(db_path) if db_path is not None else _DEFAULT_HISTORY_PATH
+        if queue_factory is not None:
+            if not callable(queue_factory):
+                raise ValueError("queue_factory must be callable or None")
+            self._queue_factory = queue_factory
+        else:
+            def _shared() -> PublishQueue:
+                return _default_shared_queue(
+                    self._config_store, self._secret_store, self._db_path
+                )
+
+            self._queue_factory = _shared
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
@@ -135,9 +200,6 @@ class TelegramSendAlbum:
         model: str = "",
     ) -> tuple[Any, ...]:
         """Send IMAGE frames as a Telegram media group; return IMAGE unchanged."""
-        _ = wait_for_upload  # Contract flag; always sends synchronously.
-        _ = protect_content  # Accepted for contract parity; not forwarded
-        _ = disable_notification  # by the send_media_group wrapper (see docs).
         # Fail-fast validation: no history, no network on bad input.
         frames = extract_frames(images)
         count = len(frames)
@@ -146,6 +208,29 @@ class TelegramSendAlbum:
                 f"sendMediaGroup needs 2-10 items; got {count} — use "
                 "Telegram Send Image for single frames."
             )
+        if not wait_for_upload:
+            return self._publish_background(
+                frames,
+                images,
+                account,
+                destination,
+                caption=caption,
+                format=format,
+                quality=quality,
+                protect_content=protect_content,
+                disable_notification=disable_notification,
+                skip_duplicate=skip_duplicate,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                seed=seed,
+                steps=steps,
+                cfg=cfg,
+                sampler=sampler,
+                scheduler=scheduler,
+                model=model,
+            )
+        _ = protect_content  # Accepted for contract parity; not forwarded
+        _ = disable_notification  # by the send_media_group wrapper (see docs).
         _logger.info(
             "telegram album publish start account=%s destination=%s frames=%s format=%s quality=%s",
             account,
@@ -277,6 +362,160 @@ class TelegramSendAlbum:
             destination,
             count,
             elapsed_ms,
+        )
+        return (images,)
+
+    def _publish_background(
+        self,
+        frames: list[Any],
+        images: Any,
+        account: str,
+        destination: str,
+        caption: str = "",
+        format: str = "png",
+        quality: int = 90,
+        protect_content: bool = False,
+        disable_notification: bool = False,
+        skip_duplicate: bool = False,
+        prompt: str = "",
+        negative_prompt: str = "",
+        seed: str = "",
+        steps: str = "",
+        cfg: str = "",
+        sampler: str = "",
+        scheduler: str = "",
+        model: str = "",
+    ) -> tuple[Any, ...]:
+        """Enqueue IMAGE frames as an album; return IMAGE immediately.
+
+        ``frames`` are pre-validated (2-10 items) by :meth:`publish`.
+        Runs the SAME pre-flight as the synchronous path (config
+        resolution, per-frame duplicate check, encoding, caption
+        rendering, hashing) and then enqueues an ``album`` payload -- no
+        network on this call. Duplicate, caption, and enqueue failures
+        raise synchronously (fail fast BEFORE enqueue, wrapped as
+        ``RuntimeError`` like the sync path); the token is never logged.
+        """
+        count = len(frames)
+        _logger.info(
+            "telegram album publish background start account=%s destination=%s"
+            " frames=%s format=%s quality=%s",
+            account,
+            destination,
+            count,
+            format,
+            quality,
+        )
+        hashes: list[str] = []
+        filename: str | None = None
+        caption_text = ""
+        try:
+            dest = self._config_store.get_destination(destination)
+            acct = self._config_store.get_account(account)
+            if dest.account_id != acct.id:
+                raise ConfigurationError(
+                    f"destination '{destination}' belongs to account "
+                    f"'{dest.account_id}', not '{account}'; refusing to "
+                    f"publish with the wrong account's token."
+                )
+            # Fail-fast only: resolved and discarded. The worker's sender
+            # re-resolves the token fresh per job (rotation-safe).
+            _ = self._config_store.resolve_token(acct.id, self._secret_store)
+            encoded_frames = [
+                encode_image(frame, format=format, quality=quality)
+                for frame in frames
+            ]
+            first = encoded_frames[0]
+            filename = f"comfyui_{first.width}x{first.height}.{first.format}"
+            metadata = GenerationMetadata.from_mapping(
+                {
+                    "prompt": prompt,
+                    "negative_prompt": negative_prompt,
+                    "seed": seed,
+                    "steps": steps,
+                    "cfg": cfg,
+                    "sampler": sampler,
+                    "scheduler": scheduler,
+                    "model": model,
+                    "width": first.width,
+                    "height": first.height,
+                    "filename": filename,
+                }
+            )
+            rendered = render_caption(caption, metadata.as_template_vars())
+            caption_text = rendered.text
+            for warning in rendered.warnings:
+                _logger.warning("telegram caption warning: %s", warning)
+            hashes = [sha256_hex(item.data) for item in encoded_frames]
+            if skip_duplicate:
+                # First hit refuses the WHOLE album before enqueue.
+                # Fail-open on DB trouble; only DuplicateError refuses.
+                repos = _history_repos(self._db_path)
+                if repos is not None:
+                    job_repo, _ = repos
+                    detector = DuplicateDetector(job_repo)
+                    try:
+                        for image_hash in hashes:
+                            detector.check(image_hash, dest.id)
+                    except DuplicateError:
+                        raise
+                    except Exception as exc:
+                        _logger.warning(
+                            "telegram duplicate check failed; proceeding: %s",
+                            exc,
+                        )
+            template_vars = metadata.as_template_vars()
+            template_vars["image_hash"] = hashes[0]
+            template_vars["filename"] = filename
+            payload = PublishPayload(
+                kind="album",
+                account_id=acct.id,
+                destination_id=dest.id,
+                chat_id=dest.chat_id,
+                files=tuple(
+                    (bytes(item.data), filename) for item in encoded_frames
+                ),
+                caption=caption_text,
+                protect_content=bool(protect_content),
+                disable_notification=bool(disable_notification),
+                metadata=template_vars,
+            )
+            job_id = self._queue_factory().enqueue(payload)
+        except Exception as exc:
+            try:
+                repos = _history_repos(self._db_path)
+                if repos is not None:
+                    job_repo, _ = repos
+                    job_repo.create(
+                        PublishJob(
+                            destination_id=destination,
+                            status="failed",
+                            image_hash=hashes[0] if hashes else None,
+                            filename=filename,
+                            caption=caption_text,
+                            attempts=0,
+                            error_code=type(exc).__name__,
+                            error_message=str(exc),
+                        )
+                    )
+            except Exception as history_exc:
+                _logger.warning("telegram history write failed: %s", history_exc)
+            message = f"Telegram publish failed: {exc}"
+            _logger.error(
+                "telegram album publish background failed account=%s"
+                " destination=%s error=%s",
+                account,
+                destination,
+                message,
+            )
+            raise RuntimeError(message) from exc
+        _logger.info(
+            "telegram album publish queued job_id=%s account=%s destination=%s"
+            " frames=%s",
+            job_id,
+            account,
+            destination,
+            count,
         )
         return (images,)
 

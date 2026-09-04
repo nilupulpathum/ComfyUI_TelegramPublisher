@@ -9,9 +9,15 @@ Decisions:
 - ``account`` / ``destination`` are plain STRING ids. Rich selector
   widgets (account/destination dropdowns) are later-epic work (T051/T052);
   until then users paste the ids from their local config.
-- ``wait_for_upload`` is accepted per the node contract, but publishing is
-  always synchronous (ADR-005: the background queue is Epic 4), so the
-  flag currently does not change behavior.
+- ``wait_for_upload=True`` (default) publishes synchronously as before.
+  ``wait_for_upload=False`` runs the SAME pre-flight (config resolution,
+  duplicate check, encoding, caption rendering, hashing) and then
+  enqueues a :class:`services.queue.PublishPayload` on the process-wide
+  shared queue, returning the input IMAGE immediately without network.
+  The background worker uploads later and moves the persisted
+  ``publish_jobs`` row to ``success``/``failed``. Validation, duplicate,
+  and caption errors still raise synchronously on the background path
+  (fail fast before enqueue).
 - ``caption`` is a template rendered with generation metadata
   (``services.captions.render_caption``). Unknown placeholders resolve to
   ``""`` with a logged warning (FR-009 fail-safe); the send proceeds.
@@ -40,6 +46,7 @@ from services.captions import render_caption
 from services.dedup import DuplicateDetector, sha256_hex
 from services.encoder import encode_image
 from services.metadata import GenerationMetadata
+from services.queue import PublishPayload, PublishQueue, get_shared_queue
 from storage.config import ConfigStore, FileSecretStore
 from storage.database import Database
 from storage.repositories import (
@@ -128,6 +135,71 @@ def _history_repos(
         return None
 
 
+def _make_sender(
+    config_store: ConfigStore, secret_store: FileSecretStore
+) -> Callable[[PublishPayload], str]:
+    """Build the queue worker's sender: fresh token per job, one attempt.
+
+    The token is resolved FRESH on every call via the stores
+    (rotation-safe) and stays a local variable: never stored on the
+    node, never logged, never interpolated into error text. The client
+    is built with ``retry_policy=None`` (single attempt) on purpose:
+    the queue WORKER owns all retries/backoff (see
+    :mod:`services.queue`), so a second retry layer here would
+    double-delay and risk double-sends (FR-008). Typed telegram errors
+    propagate for the worker to map; an unknown payload kind raises
+    ``ValueError`` (permanent failure, no retry).
+    """
+
+    def sender(payload: PublishPayload) -> str:
+        token = config_store.resolve_token(payload.account_id, secret_store)
+        client = TelegramClient(token, retry_policy=None)
+        if payload.kind == "photo":
+            data, filename = payload.files[0]
+            result = client.send_photo(
+                payload.chat_id,
+                bytes(data),
+                filename,
+                payload.caption or None,
+                protect_content=bool(payload.protect_content),
+                disable_notification=bool(payload.disable_notification),
+            )
+            return str(result.message_id)
+        if payload.kind == "album":
+            message_ids = client.send_media_group(
+                payload.chat_id,
+                [
+                    (bytes(item_data), item_name)
+                    for item_data, item_name in payload.files
+                ],
+                payload.caption or None,
+            )
+            return ",".join(str(mid) for mid in message_ids)
+        raise ValueError(f"unknown payload kind {payload.kind!r}")
+
+    return sender
+
+
+def _default_shared_queue(
+    config_store: ConfigStore,
+    secret_store: FileSecretStore,
+    db_path: Path,
+) -> PublishQueue:
+    """Return the process-wide started queue for this history database.
+
+    Created on first use via :func:`services.queue.get_shared_queue`
+    (single attempt sender; the worker owns retries) and shut down by
+    its ``atexit`` backstop when the interpreter exits.
+    """
+
+    def _factory() -> PublishQueue:
+        db = Database(db_path)
+        db.init_schema()
+        return PublishQueue(db, _make_sender(config_store, secret_store))
+
+    return get_shared_queue(str(db_path), _factory)
+
+
 def _record_generation(
     gen_repo: GenerationRepository,
     job_id: str,
@@ -165,10 +237,11 @@ class TelegramSendImage:
         secret_store: FileSecretStore | None = None,
         client_factory: Callable[[str], TelegramClient] | None = None,
         db_path: str | Path | None = None,
+        queue_factory: Callable[[], PublishQueue] | None = None,
     ) -> None:
         # Injectable seams: tests pass tmp-path stores, a fake-transport
-        # factory, and a tmp db_path so no ComfyUI, network, real secrets,
-        # or repo files are ever needed.
+        # factory, a tmp db_path, and a fake queue_factory so no ComfyUI,
+        # network, real secrets, or repo files are ever needed.
         self._config_store = (
             config_store if config_store is not None else ConfigStore(_DEFAULT_CONFIG_PATH)
         )
@@ -181,6 +254,17 @@ class TelegramSendImage:
             client_factory if client_factory is not None else TelegramClient
         )
         self._db_path = Path(db_path) if db_path is not None else _DEFAULT_HISTORY_PATH
+        if queue_factory is not None:
+            if not callable(queue_factory):
+                raise ValueError("queue_factory must be callable or None")
+            self._queue_factory = queue_factory
+        else:
+            def _shared() -> PublishQueue:
+                return _default_shared_queue(
+                    self._config_store, self._secret_store, self._db_path
+                )
+
+            self._queue_factory = _shared
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
@@ -222,7 +306,26 @@ class TelegramSendImage:
         model: str = "",
     ) -> tuple[Any, ...]:
         """Send the first IMAGE frame to Telegram; return IMAGE unchanged."""
-        _ = wait_for_upload  # Contract flag; always sends synchronously.
+        if not wait_for_upload:
+            return self._publish_background(
+                image,
+                account,
+                destination,
+                caption=caption,
+                format=format,
+                quality=quality,
+                protect_content=protect_content,
+                disable_notification=disable_notification,
+                skip_duplicate=skip_duplicate,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                seed=seed,
+                steps=steps,
+                cfg=cfg,
+                sampler=sampler,
+                scheduler=scheduler,
+                model=model,
+            )
         _logger.info(
             "telegram publish start account=%s destination=%s format=%s quality=%s",
             account,
@@ -350,6 +453,149 @@ class TelegramSendImage:
             account,
             destination,
             elapsed_ms,
+        )
+        return (image,)
+
+    def _publish_background(
+        self,
+        image: Any,
+        account: str,
+        destination: str,
+        caption: str = "",
+        format: str = "png",
+        quality: int = 90,
+        protect_content: bool = False,
+        disable_notification: bool = False,
+        skip_duplicate: bool = False,
+        prompt: str = "",
+        negative_prompt: str = "",
+        seed: str = "",
+        steps: str = "",
+        cfg: str = "",
+        sampler: str = "",
+        scheduler: str = "",
+        model: str = "",
+    ) -> tuple[Any, ...]:
+        """Enqueue the first IMAGE frame; return IMAGE immediately.
+
+        Runs the SAME pre-flight as the synchronous path (config
+        resolution, duplicate check, encoding, caption rendering,
+        hashing) and then enqueues a ``photo`` payload -- no network on
+        this call. Validation, duplicate, caption, and enqueue failures
+        raise synchronously (fail fast BEFORE enqueue, wrapped as
+        ``RuntimeError`` like the sync path); the token is never logged.
+        """
+        _logger.info(
+            "telegram publish background start account=%s destination=%s"
+            " format=%s quality=%s",
+            account,
+            destination,
+            format,
+            quality,
+        )
+        image_hash: str | None = None
+        filename: str | None = None
+        caption_text = ""
+        try:
+            dest = self._config_store.get_destination(destination)
+            acct = self._config_store.get_account(account)
+            if dest.account_id != acct.id:
+                raise ConfigurationError(
+                    f"destination '{destination}' belongs to account "
+                    f"'{dest.account_id}', not '{account}'; refusing to "
+                    f"publish with the wrong account's token."
+                )
+            # Fail-fast only: resolved and discarded. The worker's sender
+            # re-resolves the token fresh per job (rotation-safe).
+            _ = self._config_store.resolve_token(acct.id, self._secret_store)
+            frame = _first_frame(image)
+            encoded = encode_image(frame, format=format, quality=quality)
+            filename = f"comfyui_{encoded.width}x{encoded.height}.{encoded.format}"
+            metadata = GenerationMetadata.from_mapping(
+                {
+                    "prompt": prompt,
+                    "negative_prompt": negative_prompt,
+                    "seed": seed,
+                    "steps": steps,
+                    "cfg": cfg,
+                    "sampler": sampler,
+                    "scheduler": scheduler,
+                    "model": model,
+                    "width": encoded.width,
+                    "height": encoded.height,
+                    "filename": filename,
+                }
+            )
+            rendered = render_caption(caption, metadata.as_template_vars())
+            caption_text = rendered.text
+            for warning in rendered.warnings:
+                _logger.warning("telegram caption warning: %s", warning)
+            image_hash = sha256_hex(encoded.data)
+            if skip_duplicate:
+                # Fail-open like the sync path; only a positive
+                # DuplicateError refuses the publish (before enqueue).
+                repos = _history_repos(self._db_path)
+                if repos is not None:
+                    job_repo, _ = repos
+                    try:
+                        DuplicateDetector(job_repo).check(image_hash, dest.id)
+                    except DuplicateError:
+                        raise
+                    except Exception as exc:
+                        _logger.warning(
+                            "telegram duplicate check failed; proceeding: %s",
+                            exc,
+                        )
+            template_vars = metadata.as_template_vars()
+            template_vars["image_hash"] = image_hash
+            template_vars["filename"] = filename
+            payload = PublishPayload(
+                kind="photo",
+                account_id=acct.id,
+                destination_id=dest.id,
+                chat_id=dest.chat_id,
+                files=((bytes(encoded.data), filename),),
+                caption=caption_text,
+                protect_content=bool(protect_content),
+                disable_notification=bool(disable_notification),
+                metadata=template_vars,
+            )
+            job_id = self._queue_factory().enqueue(payload)
+        except Exception as exc:
+            try:
+                repos = _history_repos(self._db_path)
+                if repos is not None:
+                    job_repo, _ = repos
+                    job_repo.create(
+                        PublishJob(
+                            destination_id=destination,
+                            status="failed",
+                            image_hash=image_hash,
+                            filename=filename,
+                            caption=caption_text,
+                            attempts=0,
+                            error_code=type(exc).__name__,
+                            error_message=str(exc),
+                        )
+                    )
+            except Exception as history_exc:
+                _logger.warning(
+                    "telegram history write failed: %s", history_exc
+                )
+            message = f"Telegram publish failed: {exc}"
+            _logger.error(
+                "telegram publish background failed account=%s destination=%s"
+                " error=%s",
+                account,
+                destination,
+                message,
+            )
+            raise RuntimeError(message) from exc
+        _logger.info(
+            "telegram publish queued job_id=%s account=%s destination=%s",
+            job_id,
+            account,
+            destination,
         )
         return (image,)
 

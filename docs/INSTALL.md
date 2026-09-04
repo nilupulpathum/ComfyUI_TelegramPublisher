@@ -160,6 +160,22 @@ publish). Both nodes also accept optional metadata inputs (`prompt`,
 `negative_prompt`, `seed`, `steps`, `cfg`, `sampler`, `scheduler`,
 `model`) used for `{{placeholder}}` caption templates and history rows.
 
+Both nodes have a `wait_for_upload` flag (`BOOLEAN`, default `True`).
+With the default, the node uploads before returning. With
+`wait_for_upload=False` (background mode), the node validates,
+encodes, and enqueues the publish, then returns immediately while a
+shared background worker uploads later; the persisted `publish_jobs`
+row in `history/publisher.sqlite3` moves from `queued` to `success`
+(with the Telegram message id) or `failed` (with `error_code` /
+`error_message`). Until the status UI lands (T054), job outcomes for
+background publishes are visible in two places: the ComfyUI console
+log (look for `telegram publish queued job_id=...`, then worker
+success/transient/failure lines) and the `publish_jobs` table itself,
+e.g. `SELECT id, status, attempts, telegram_message_id, error_code
+FROM publish_jobs ORDER BY created_at DESC LIMIT 10;` with any SQLite
+reader. `queued` rows with a future `next_retry_at` are scheduled
+retries, not stuck jobs.
+
 The expected flow (per `docs/PRD.md` section 9) is: load the sample
 workflow → generate an image → publish it to the configured Telegram
 destination → continue the workflow through the node → check for clear
