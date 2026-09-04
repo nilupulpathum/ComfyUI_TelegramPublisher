@@ -154,6 +154,31 @@ def _is_dropped(node_type: str) -> bool:
     return node_type in _DROPPED_TYPES or node_type.startswith("Label")
 
 
+def unconnected_node_ids(nodes: Any, links: Any) -> list[str]:
+    """Ids (as strings, canvas order) of nodes referenced by no link.
+
+    A node counts as connected when its id appears as a link source
+    (``entry[1]``) or target (``entry[3]``). Malformed link entries are
+    ignored here; :func:`canvas_to_prompt` rejects them loudly on its
+    own pass. Exposed so callers (and users) can see exactly which
+    nodes conversion drops as provably inert.
+    """
+    touched: set[str] = set()
+    if isinstance(links, list):
+        for entry in links:
+            if isinstance(entry, (list, tuple)) and len(entry) >= 5:
+                touched.add(str(entry[1]))
+                touched.add(str(entry[3]))
+    result: list[str] = []
+    if isinstance(nodes, list):
+        for node in nodes:
+            if isinstance(node, dict) and "id" in node:
+                key = str(node["id"])
+                if key not in touched and key not in result:
+                    result.append(key)
+    return result
+
+
 def canvas_to_prompt(canvas: dict, specs: dict) -> dict:
     """Convert a canvas-format workflow to a bare API prompt map.
 
@@ -168,6 +193,10 @@ def canvas_to_prompt(canvas: dict, specs: dict) -> dict:
       ``mode``, types ``{"Note", "Reroute"}``, and types starting with
       ``"Label"``. Entries missing ``id``/``type`` are garbage ->
       :class:`ValueError` listing them.
+    - DROP kept nodes with no link touching them (neither as source nor
+      target): with no data flowing in or out they cannot affect
+      execution (typically stale UI helpers from removed extensions).
+      Unknown types are still loud when CONNECTED (see below).
     - Links resolve via the links table (``[id, from, slot, ...]``). A
       kept input whose link id is missing from the table or points at a
       dropped/missing node -> :class:`ValueError` naming node+input
@@ -176,26 +205,33 @@ def canvas_to_prompt(canvas: dict, specs: dict) -> dict:
       ``{"class_type": type, "inputs": {...}}`` with inputs in canvas
       order. Linked inputs become ``[str(from_node), from_slot]``.
       Unlinked inputs WITH a ``"widget"`` marker consume
-      ``widgets_values`` positionally, SKIPPING top-level dict values
-      (custom-node UI state such as LoraManager autocomplete metadata —
-      never backend inputs); a widget-marked input with no remaining
+      ``widgets_values`` in order, SKIPPING top-level dict values
+      (custom-node UI state such as LoraManager autocomplete
+      metadata — never backend inputs) AND values whose type is
+      incompatible with the input's object_info typedef (stale
+      widget-only values from other ComfyUI versions, e.g. a removed
+      ``control_after_generate`` ``"randomize"`` where ``steps``
+      expects an int — skipped instead of shifting every input that
+      follows); a widget-marked input with no remaining compatible
       value falls back to the spec required default. Unlinked inputs
       WITHOUT a marker take the spec required default; no default and
       no value -> :class:`ValueError` naming node+input. A widget-marked
       unlinked input whose name is optional-only is skipped (its
       positional value is still consumed, preserving alignment for the
-      inputs that follow); a name in neither required nor optional ->
-      :class:`ValueError`.
+      inputs that follow). Canvas inputs absent from BOTH the spec
+      required and optional sets are frontend-only plumbing (e.g.
+      shape-7 converted-widget links) and are skipped without
+      consuming values.
     - Spec defaults: ``required[name] = [typedef, opts]``; the default is
       ``opts.get("default")`` when ``opts`` is a dict, else none.
-      Unknown node types (absent from ``specs``) -> :class:`ValueError`
-      naming the type. Optional inputs are included ONLY when linked
-      (frontend parity).
-
-    Known approximation: ``widgets_values`` is positional, so widgets
-    without a canvas input entry (e.g. KSampler's
-    ``control_after_generate``) shift the values that follow. The live
-    trial (T082) must confirm real workflows convert faithfully.
+      Optional inputs are included ONLY when linked (frontend parity).
+    - Completeness: every spec required input must end up present
+      (definition-side inputs with no canvas entry are filled from
+      their spec default); required inputs with no value and no
+      default -> :class:`ValueError` naming node+inputs.
+    - Unknown node types (absent from ``specs``) -> :class:`ValueError`
+      naming the type (only reachable for link-connected nodes;
+      unconnected nodes are dropped before this check).
     """
     if not isinstance(canvas, dict):
         raise ValueError("canvas workflow must be a JSON object")
@@ -247,6 +283,17 @@ def canvas_to_prompt(canvas: dict, specs: dict) -> dict:
             f"({', '.join(garbage)})"
         )
 
+    # -- drop unconnected --------------------------------------------------
+    # A kept node referenced by no link (as source or target) carries no
+    # data in or out, so dropping it cannot change execution. Unknown
+    # types stay loud when connected; only provably inert nodes go
+    # quietly. Exposed as unconnected_node_ids() for transparency.
+    for key in unconnected_node_ids(nodes, links):
+        if key in kept:
+            dropped_ids.add(key)
+            del kept[key]
+    kept_order = [key for key in kept_order if key in kept]
+
     # -- per-node conversion -------------------------------------------------
     prompt: dict[str, dict] = {}
     for key in kept_order:
@@ -276,7 +323,11 @@ def canvas_to_prompt(canvas: dict, specs: dict) -> dict:
                 f"canvas node '{key}' ({node_type}) has malformed widgets_values"
             )
         # Positional values, skipping top-level dicts (custom-node UI
-        # state, never backend inputs).
+        # state, never backend inputs). Values are then matched to
+        # widget-marked inputs by TYPE compatibility (see
+        # _typedef_compat): stale widget-only values from other
+        # ComfyUI versions (e.g. a removed control_after_generate
+        # "randomize") are skipped instead of shifting everything.
         values = [v for v in raw_values if not isinstance(v, dict)]
         cursor = 0
 
@@ -294,6 +345,16 @@ def canvas_to_prompt(canvas: dict, specs: dict) -> dict:
                     f"canvas node '{key}' ({node_type}) has a malformed input entry"
                 )
             name = entry["name"]
+            # Frontend-only plumbing (e.g. shape-7 converted-widget links
+            # such as LoraManager's clip/lora_stack): absent from the
+            # object_info required AND optional sets, so the backend
+            # accepts no such input. Skip without consuming values.
+            if name not in required and name not in optional:
+                continue
+            if not isinstance(name, str):
+                raise ValueError(
+                    f"canvas node '{key}' ({node_type}) has a malformed input name"
+                )
             link = entry.get("link")
             if link is not None:
                 if link not in link_table:
@@ -311,23 +372,25 @@ def canvas_to_prompt(canvas: dict, specs: dict) -> dict:
                 inputs[str(name)] = [from_key, from_slot]
                 continue
             # Unlinked.
-            in_required = isinstance(name, str) and name in required
-            in_optional = isinstance(name, str) and name in optional
+            in_required = name in required
+            in_optional = name in optional
             marked = entry.get("widget") is not None
             if marked:
+                typedef = (required if in_required else optional).get(name)
                 value: Any = None
                 have_value = False
-                if cursor < len(values):
-                    value = values[cursor]
-                    have_value = True
-                cursor += 1
+                while cursor < len(values):
+                    candidate = values[cursor]
+                    cursor += 1
+                    if _typedef_compat(typedef, candidate):
+                        value = candidate
+                        have_value = True
+                        break
+                    # Incompatible: stale widget-only value (e.g. from a
+                    # removed input in another ComfyUI version). Skip it
+                    # instead of shifting every input that follows.
                 if not in_required:
-                    if in_optional:
-                        continue  # optional-only: value consumed, not sent.
-                    raise ValueError(
-                        f"canvas node '{key}' ({node_type}) input '{name}' "
-                        "is unknown to object_info"
-                    )
+                    continue  # optional-only: value consumed, not sent.
                 if have_value:
                     inputs[str(name)] = value
                     continue
@@ -340,20 +403,62 @@ def canvas_to_prompt(canvas: dict, specs: dict) -> dict:
                 inputs[str(name)] = default
                 continue
             if not in_required:
-                if in_optional:
-                    continue  # optional-only and unlinked: omit.
-                raise ValueError(
-                    f"canvas node '{key}' ({node_type}) input '{name}' "
-                    "is unknown to object_info"
-                )
+                continue  # optional-only and unlinked: omit.
             if not _has_default(required, name):
                 raise ValueError(
                     f"canvas node '{key}' ({node_type}) input '{name}' "
                     "has no widget value and no object_info default"
                 )
             inputs[str(name)] = _spec_default(required, name)
+        # Completeness: every required object_info input must be present.
+        # (Covers definition-side inputs with no canvas entry at all.)
+        missing = [n for n in required if n not in inputs]
+        if missing:
+            filled: dict[str, Any] = {}
+            unfillable: list[str] = []
+            for name in missing:
+                if _has_default(required, name):
+                    filled[name] = _spec_default(required, name)
+                else:
+                    unfillable.append(name)
+            if unfillable:
+                raise ValueError(
+                    f"canvas node '{key}' ({node_type}) is missing required "
+                    f"inputs with no default: {', '.join(unfillable)}"
+                )
+            inputs.update(filled)
         prompt[key] = {"class_type": node_type, "inputs": inputs}
     return prompt
+
+
+def _typedef_compat(typedef: Any, value: Any) -> bool:
+    """Whether a canvas widget value can fill an object_info input.
+
+    Guards positional mapping against stale widget-only values left by
+    other ComfyUI versions (e.g. a removed ``control_after_generate``
+    ``"randomize"`` sitting where ``steps`` expects an int): only a
+    type-compatible value is consumed, the rest are skipped. Unknown
+    typedef shapes stay lenient (accept) so exotic custom types keep
+    working; an empty combo options list also accepts (nothing to
+    judge against).
+    """
+    if not isinstance(typedef, (list, tuple)) or not typedef:
+        return True
+    base = typedef[0]
+    if isinstance(base, list):
+        return not base or value in base
+    if not isinstance(base, str):
+        return True
+    upper = base.upper()
+    if upper == "INT":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if upper == "FLOAT":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if upper in ("BOOLEAN", "BOOL"):
+        return isinstance(value, bool)
+    if "STRING" in upper:
+        return isinstance(value, str)
+    return True
 
 
 def _spec_default(required: dict, name: str) -> Any:

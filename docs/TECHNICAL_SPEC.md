@@ -463,6 +463,11 @@ Conversion rules:
 - Keep nodes with `mode` in `(0, None/missing)`; DROP `mode != 0`,
   types `{"Note", "Reroute"}`, and types starting with `"Label"`.
   Entries missing `id`/`type` -> `ValueError` listing them.
+- DROP kept nodes referenced by no link at all (neither as source nor
+  target): with no data flowing in or out they cannot affect execution
+  (typically stale UI helpers from removed extensions, e.g. a
+  disconnected bypass widget). Unknown types stay loud when connected;
+  only provably inert nodes go quietly (`unconnected_node_ids()`).
 - Links resolve via the links table
   (`[id, from_node, from_slot, to_node, to_slot, type]`). A kept input
   whose link id is missing or points at a dropped/missing node ->

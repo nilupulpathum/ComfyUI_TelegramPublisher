@@ -22,6 +22,7 @@ from services.canvas import (
     canvas_to_prompt,
     detect_format,
     fetch_object_info,
+    unconnected_node_ids,
 )
 
 # ---------------------------------------------------------------------------
@@ -218,11 +219,13 @@ def test_canvas_happy_dict_skip_and_drops() -> None:
     # Widget-marked values map positionally.
     assert prompt["4"]["inputs"]["seed"] == 235398267971802
     assert prompt["4"]["inputs"]["steps"] == 10
-    # Unlisted optional KSampler inputs (cfg/...) are absent, not defaulted.
-    assert "cfg" not in prompt["4"]["inputs"]
+    # Unlisted required KSampler inputs (cfg/...) are filled from spec
+    # defaults (frontend parity), not omitted.
+    assert prompt["4"]["inputs"]["cfg"] == 8.0
 
 
 def test_canvas_dangling_link_fails_loud() -> None:
+    # No links at all: the node is unconnected, so it drops quietly.
     canvas = {
         "nodes": [
             {"id": 1, "type": "CLIPTextEncode", "mode": 0,
@@ -235,8 +238,7 @@ def test_canvas_dangling_link_fails_loud() -> None:
         ],
         "links": [],
     }
-    with pytest.raises(ValueError, match="'1'.*'clip'"):
-        canvas_to_prompt(canvas, mini_specs())
+    assert canvas_to_prompt(canvas, mini_specs()) == {}
     # Link id resolves in the table but points at a missing node: refusal.
     canvas["links"] = [link(7, 2, 0, 1, 0)]
     with pytest.raises(ValueError, match="'1'.*'clip'.*'2'"):
@@ -262,10 +264,15 @@ def test_canvas_link_to_bypassed_node_fails() -> None:
 
 
 def test_canvas_unknown_type_fails() -> None:
+    # Connected (link touches it) but absent from object_info: loud.
     canvas = {
         "nodes": [{"id": 1, "type": "NopeNode", "mode": 0,
-                   "inputs": [], "outputs": []}],
-        "links": [],
+                   "inputs": [], "outputs": []},
+                  {"id": 2, "type": "VAELoader", "mode": 0,
+                   "inputs": [{"name": "vae_name", "type": "COMBO",
+                               "widget": {"name": "vae_name"}, "link": None}],
+                   "outputs": [], "widgets_values": ["x.safetensors"]}],
+        "links": [link(9, 1, 0, 2, 0)],
     }
     with pytest.raises(ValueError, match="NopeNode"):
         canvas_to_prompt(canvas, mini_specs())
@@ -282,6 +289,8 @@ def test_canvas_garbage_entries_listed() -> None:
 
 def test_canvas_unmarked_uses_spec_default_or_fails() -> None:
     # EmptyLatentImage batch_size: unlinked, no widget marker.
+    # NOTE: the links-table entry only marks node 5 connected; none of
+    # its inputs reference it, so conversion is unaffected.
     canvas = {
         "nodes": [
             {"id": 5, "type": "EmptyLatentImage", "mode": 0,
@@ -294,7 +303,7 @@ def test_canvas_unmarked_uses_spec_default_or_fails() -> None:
              ],
              "outputs": [], "widgets_values": [1024, 1024]},
         ],
-        "links": [],
+        "links": [link(3, 5, 0, 5, 0)],
     }
     prompt = canvas_to_prompt(canvas, mini_specs())
     assert prompt["5"]["inputs"] == {
@@ -317,6 +326,7 @@ def test_canvas_unmarked_uses_spec_default_or_fails() -> None:
 
 
 def test_canvas_widget_exhaustion_falls_back_to_default() -> None:
+    # NOTE: table-only link marks node 5 connected; conversion unaffected.
     canvas = {
         "nodes": [
             {"id": 5, "type": "EmptyLatentImage", "mode": 0,
@@ -326,10 +336,11 @@ def test_canvas_widget_exhaustion_falls_back_to_default() -> None:
              ],
              "outputs": [], "widgets_values": []},
         ],
-        "links": [],
+        "links": [link(3, 5, 0, 5, 0)],
     }
     prompt = canvas_to_prompt(canvas, mini_specs())
-    assert prompt["5"]["inputs"] == {"width": 512}
+    assert prompt["5"]["inputs"] == {"width": 512, "height": 512,
+                                     "batch_size": 1}
 
 
 def test_canvas_optional_only_when_linked() -> None:
@@ -353,6 +364,7 @@ def test_canvas_optional_only_when_linked() -> None:
 
 
 def test_canvas_mode_missing_or_none_kept() -> None:
+    # NOTE: table-only link marks both nodes connected.
     canvas = {
         "nodes": [
             {"id": 1, "type": "VAELoader",
@@ -364,7 +376,7 @@ def test_canvas_mode_missing_or_none_kept() -> None:
                          "widget": {"name": "vae_name"}, "link": None}],
              "outputs": [], "widgets_values": ["b.safetensors"]},
         ],
-        "links": [],
+        "links": [link(5, 1, 0, 2, 0)],
     }
     prompt = canvas_to_prompt(canvas, mini_specs())
     assert set(prompt) == {"1", "2"}
@@ -517,3 +529,131 @@ def test_fetch_object_info_unreachable() -> None:
     server.server_close()
     with pytest.raises(ConnectionError):
         fetch_object_info(f"http://127.0.0.1:{port}")
+
+
+def _node(node_id: int, node_type: str, **kw: Any) -> dict:
+    node: dict = {"id": node_id, "type": node_type, "mode": 0}
+    node.update(kw)
+    return node
+
+
+def _vae_node(node_id: int, value: str) -> dict:
+    # VAELoader's single required input (vae_name, no default) keeps
+    # fixtures completeness-safe: no linked clip needed.
+    return _node(
+        node_id,
+        "VAELoader",
+        inputs=[{"name": "vae_name", "type": "COMBO",
+                 "widget": {"name": "vae_name"}, "link": None}],
+        widgets_values=[value],
+    )
+
+
+def test_unconnected_node_ids() -> None:
+    nodes = [
+        _node(1, "KSampler"),
+        _node(58, "Fast Groups Bypasser (rgthree)"),
+        _node(9, "Note"),
+    ]
+    links = [[10, 1, 0, 2, 0, "MODEL"]]
+    assert unconnected_node_ids(nodes, links) == ["58", "9"]
+    assert unconnected_node_ids(nodes, []) == ["1", "58", "9"]
+    assert unconnected_node_ids("junk", links) == []
+    assert unconnected_node_ids(nodes, "junk") == ["1", "58", "9"]
+
+
+def test_unconnected_unknown_type_dropped_quietly() -> None:
+    # Node 3 is link-touched (table-only entry); node 58 is not.
+    canvas = {
+        "nodes": [
+            _vae_node(3, "hi.safetensors"),
+            _node(58, "Fast Groups Bypasser (rgthree)", inputs=[],
+                   outputs=[{"name": "OPT_CONNECTION", "type": "*",
+                             "links": None}]),
+        ],
+        "links": [link(10, 3, 0, 3, 0)],
+    }
+    prompt = canvas_to_prompt(canvas, mini_specs())
+    assert set(prompt) == {"3"}
+    assert prompt["3"]["inputs"]["vae_name"] == "hi.safetensors"
+
+
+def test_unconnected_known_type_dropped() -> None:
+    canvas = {
+        "nodes": [
+            _vae_node(3, "hi.safetensors"),
+            _vae_node(7, "stray.safetensors"),
+        ],
+        "links": [link(10, 3, 0, 3, 0)],
+    }
+    prompt = canvas_to_prompt(canvas, mini_specs())
+    assert set(prompt) == {"3"}
+
+
+def test_connected_unknown_type_still_loud() -> None:
+    canvas = {
+        "nodes": [
+            _node(
+                4,
+                "Mystery Node (gone)",
+                inputs=[{"name": "text", "type": "STRING", "link": 10,
+                         "widget": {"name": "text"}}],
+                widgets_values=["x"],
+            ),
+            _vae_node(2, "x.safetensors"),
+        ],
+        "links": [[10, 4, 0, 2, 0]],
+    }
+    with pytest.raises(ValueError, match="Mystery Node"):
+        canvas_to_prompt(canvas, mini_specs())
+
+
+def test_stale_scalar_value_skipped_not_shifted() -> None:
+    # KSampler saved by another ComfyUI version carries a stale
+    # control_after_generate value ("randomize") with no canvas input
+    # and no spec entry: steps must still read 10, not "randomize".
+    canvas = {
+        "nodes": [
+            {"id": 4, "type": "KSampler", "mode": 0,
+             "inputs": [
+                 {"name": "seed", "type": "INT",
+                  "widget": {"name": "seed"}, "link": None},
+                 {"name": "steps", "type": "INT",
+                  "widget": {"name": "steps"}, "link": None},
+             ],
+             "outputs": [],
+             "widgets_values": [235398267971802, "randomize", 10]},
+        ],
+        "links": [link(3, 4, 0, 4, 0)],
+    }
+    specs = {
+        "KSampler": {
+            "input": {
+                "required": {
+                    "seed": ["INT", {"default": 0}],
+                    "steps": ["INT", {"default": 20}],
+                }
+            }
+        }
+    }
+    prompt = canvas_to_prompt(canvas, specs)
+    assert prompt["4"]["inputs"]["seed"] == 235398267971802
+    assert prompt["4"]["inputs"]["steps"] == 10
+
+
+def test_typedef_compat_matrix() -> None:
+    from services.canvas import _typedef_compat
+
+    assert _typedef_compat(["INT", {}], 3)
+    assert not _typedef_compat(["INT", {}], "3")
+    assert not _typedef_compat(["INT", {}], True)
+    assert _typedef_compat(["FLOAT", {}], 1)
+    assert _typedef_compat(["FLOAT", {}], 1.5)
+    assert not _typedef_compat(["FLOAT", {}], "x")
+    assert _typedef_compat(["STRING", {}], "hi")
+    assert not _typedef_compat(["STRING", {}], 3)
+    assert _typedef_compat([["a", "b"], {}], "a")
+    assert not _typedef_compat([["a", "b"], {}], "z")
+    assert _typedef_compat([[], {}], "anything")
+    assert _typedef_compat("junk", "anything")
+    assert _typedef_compat(["MODEL", {}], object())
