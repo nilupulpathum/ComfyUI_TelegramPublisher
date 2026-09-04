@@ -249,7 +249,10 @@ All remote control is OFF unless explicitly configured (see
 2. **Review mode.** Set `"review_mode": true` to stage publishes for
    approval instead of sending immediately. Admins then release each
    image with `/approve <jobid>` or drop it with `/reject <jobid>`.
-   Staged payloads live under `<extension>/history/review/`.
+   Staged payloads live under `<extension>/history/review/`. Staged
+   reviews expire after 7 days without approval (swept on the next
+   Telegram Command Poller run; expired jobs are kept as
+   `failed`/`Expired` history rows).
 3. **Command list.** `/help`, `/status`, `/queue` (read-only);
    `/approve <jobid>`, `/reject <jobid>` (review); `/run <name>`
    (trigger a local workflow, see next step).

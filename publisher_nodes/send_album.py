@@ -20,10 +20,9 @@ Decisions:
 - ``caption`` is a template rendered with generation metadata (width,
   height, and filename come from the FIRST encoded frame); the rendered
   text goes on the first album item only (Telegram behavior).
-- ``protect_content`` / ``disable_notification`` are accepted for
-  contract parity with Send Image, but the ``sendMediaGroup`` wrapper
-  does not expose per-send flags, so they are carried on the payload
-  and ignored at send time (both paths).
+- ``protect_content`` / ``disable_notification`` are forwarded to the
+  ``sendMediaGroup`` wrapper (encoded as ``"true"``/``"false"`` like
+  Send Image) on both the sync path and the background worker sender.
 - ``wait_for_upload=True`` (default) publishes synchronously as before.
   ``wait_for_upload=False`` runs the SAME pre-flight (frame-count
   validation, config resolution, duplicate check, encoding, caption
@@ -100,7 +99,7 @@ def _make_sender(
     error text. Single attempt (``retry_policy=None``): the worker owns
     retries (FR-008). Album dispatch uses ``send_media_group`` (caption
     on the first item via the client); per-send ``protect_content`` /
-    ``disable_notification`` flags are not forwarded by that wrapper.
+    ``disable_notification`` flags are forwarded to that wrapper.
     """
 
     def sender(payload: PublishPayload) -> str:
@@ -125,6 +124,8 @@ def _make_sender(
                     for item_data, item_name in payload.files
                 ],
                 payload.caption or None,
+                protect_content=bool(payload.protect_content),
+                disable_notification=bool(payload.disable_notification),
             )
             return ",".join(str(mid) for mid in message_ids)
         raise ValueError(f"unknown payload kind {payload.kind!r}")
@@ -266,8 +267,7 @@ class TelegramSendAlbum:
                 scheduler=scheduler,
                 model=model,
             )
-        _ = protect_content  # Accepted for contract parity; not forwarded
-        _ = disable_notification  # by the send_media_group wrapper (see docs).
+
         _logger.info(
             "telegram album publish start account=%s destination=%s frames=%s format=%s quality=%s",
             account,
@@ -341,6 +341,8 @@ class TelegramSendAlbum:
                 dest.chat_id,
                 [(item.data, filename) for item in encoded_frames],
                 caption_text or None,
+                protect_content=bool(protect_content),
+                disable_notification=bool(disable_notification),
             )
             try:
                 repos = _history_repos(self._db_path)

@@ -31,6 +31,11 @@ Decisions:
   best-effort like the siblings: ``init_schema()`` runs inside try/except
   and any failure warns without blocking polling (handlers degrade to
   empty counts / the fixed error reply).
+- Review GC host: every run with admins configured calls
+  ``services.review.prune_expired`` once (default TTL) BEFORE the first
+  ``getUpdates`` poll, so abandoned ``pending_review`` payloads expire
+  without a separate node or thread. GC is best-effort: any failure
+  warns and polling continues; counts log at info level.
 - Every failure surfaces as ``RuntimeError`` carrying an actionable,
   token-free message (same contract as the publishers); the original is
   chained. The bot token is never interpolated into messages or logs.
@@ -57,7 +62,7 @@ from services.commands import (
     register_builtins,
     register_review,
 )
-from services.review import review_dir_for
+from services.review import prune_expired, review_dir_for
 from storage.config import ConfigStore, FileSecretStore
 from storage.database import Database
 from storage.repositories import GenerationRepository, PublishJobRepository
@@ -222,7 +227,13 @@ class TelegramCommandPoller:
         rounds: int,
         timeout: int,
     ) -> tuple[str, ...]:
-        """Build the Epic 6 stack and run ``rounds`` receiver polls."""
+        """Build the Epic 6 stack, expire stale reviews, run ``rounds`` polls.
+
+        Review expiry (``services.review.prune_expired`` with the default
+        TTL) runs once here, before the first ``getUpdates`` poll, making
+        this driver the GC host (T071). It is best-effort: any failure
+        warns and polling continues normally.
+        """
         try:
             db = Database(self._db_path)
             db.init_schema()
@@ -235,6 +246,19 @@ class TelegramCommandPoller:
         jobs = PublishJobRepository(db)
         generations = GenerationRepository(db)
         review_dir = review_dir_for(self._db_path)
+        try:
+            expiry = prune_expired(review_dir, jobs)
+        except Exception as exc:
+            # Best-effort GC: expiry must never fail a polling run.
+            _logger.warning("telegram review expiry failed: %s", exc)
+        else:
+            _logger.info(
+                "telegram review expiry account=%s expired=%s orphans=%s kept=%s",
+                account_id,
+                expiry.get("expired", 0),
+                expiry.get("orphans", 0),
+                expiry.get("kept", 0),
+            )
         client = self._client_factory(token)
         ctx = BotContext(
             client=client,

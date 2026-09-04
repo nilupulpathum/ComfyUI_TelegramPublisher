@@ -351,3 +351,34 @@ def test_history_failure_still_publishes(tmp_path: Path):
 
     assert result is batch
     assert len(record) == 1
+# ---------------------------------------------------------------------------
+# T072: protect/silent flags reach the transport on the sync path
+# ---------------------------------------------------------------------------
+
+
+def test_sync_path_forwards_flags_true(tmp_path: Path):
+    record: list = []
+    node = make_node(tmp_path, ok_media_transport(record))
+    batch = np.stack([frame(7), frame(8)])
+
+    node.publish(
+        batch,
+        ACCOUNT_ID,
+        DEST_ID,
+        protect_content=True,
+        disable_notification=True,
+    )
+
+    assert record[0]["data"]["protect_content"] == "true"
+    assert record[0]["data"]["disable_notification"] == "true"
+
+
+def test_sync_path_forwards_flags_default_false(tmp_path: Path):
+    record: list = []
+    node = make_node(tmp_path, ok_media_transport(record))
+    batch = np.stack([frame(7), frame(8)])
+
+    node.publish(batch, ACCOUNT_ID, DEST_ID)
+
+    assert record[0]["data"]["protect_content"] == "false"
+    assert record[0]["data"]["disable_notification"] == "false"

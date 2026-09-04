@@ -261,16 +261,16 @@ Inputs:
   rendered text is attached to the first album item only)
 - `format: enum(png,jpeg)`
 - `quality: INT`
-- `protect_content: BOOLEAN` (accepted for contract parity; currently not
-  forwarded by the `sendMediaGroup` wrapper)
-- `disable_notification: BOOLEAN` (accepted for contract parity; currently
-  not forwarded by the `sendMediaGroup` wrapper)
+- `protect_content: BOOLEAN` (forwarded to `sendMediaGroup` as
+  `"true"`/`"false"`, same encoding as Send Image)
+- `disable_notification: BOOLEAN` (forwarded to `sendMediaGroup` as
+  `"true"`/`"false"`, same encoding as Send Image)
 - `skip_duplicate: BOOLEAN` (checks EVERY frame hash; the first hit
   refuses the WHOLE album — no partial album is ever sent)
 - `wait_for_upload: BOOLEAN` (see "Background publishing" above:
   `False` enqueues an `album` payload with all files and returns
   immediately; per-send `protect_content`/`disable_notification` are
-  carried but not forwarded by the `sendMediaGroup` wrapper)
+  carried on the payload and forwarded by the background sender)
 
 Optional metadata inputs: same eight `STRING` inputs as Send Image
 (`prompt`, `negative_prompt`, `seed`, `steps`, `cfg`, `sampler`,
@@ -390,6 +390,35 @@ return the fixed string `error processing command`.
 3. `/reject <jobid>`: same lookup; a pending row moves to
    `failed`/`Rejected`, the file is discarded (idempotent), reply
    `rejected publish to <dest>`.
+
+### 9.3.1 Review expiry (T071)
+
+Abandoned `pending_review` rows/payloads (never approved/rejected) are
+reclaimed by `services.review.prune_expired` with
+`DEFAULT_REVIEW_TTL_S = 604800` (7 days). Per `*.png` file under the
+review directory (job id = file stem, re-validated against
+`[A-Za-z0-9_-]{1,64}`; anything else is a stray file: kept + warning):
+
+- no job row -> file deleted (`"expired"`);
+- row terminal (`success`/`failed`) with a leftover file -> file deleted,
+  record preserved (`"orphans"`);
+- row `pending_review` older than the TTL (`now - created_at > ttl_s`,
+  `created_at` = UTC ISO row timestamp) -> row marked `failed`
+  (`error_code="Expired"`, `error_message="review expired without
+  approval"`; the record is preserved, only the PNG is removed) +
+  file deleted (`"expired"`);
+- row `pending_review` within TTL -> kept (`"kept"`);
+- row `pending_review` with missing/unparseable `created_at`, or a row
+  with any other non-terminal status -> kept + warning (fail-safe
+  toward PRESERVATION).
+
+`prune_expired(review_dir, jobs, *, ttl_s=DEFAULT_REVIEW_TTL_S,
+now=None) -> {"expired", "orphans", "kept"}` never raises on per-file
+errors (lookup/update/delete failures warn and count the file as
+`"kept"`); `now` is epoch seconds (defaults to wall clock) for
+deterministic tests. GC host: the Telegram Command Poller node calls it
+best-effort once per `poll()` run with the default TTL before the first
+`getUpdates` poll; any GC failure warns and polling continues.
 
 ### 9.4 Trigger contract (T065)
 

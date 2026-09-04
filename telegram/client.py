@@ -392,8 +392,16 @@ class TelegramClient:
         caption: str | None = None,
         *,
         timeout: float | None = None,
+        protect_content: bool = False,
+        disable_notification: bool = False,
     ) -> list[int]:
-        """Upload an album via sendMediaGroup. Returns message ids."""
+        """Upload an album via sendMediaGroup. Returns message ids.
+
+        ``protect_content`` and ``disable_notification`` map to the
+        Bot API ``sendMediaGroup`` fields of the same name, encoded as
+        ``"true"``/``"false"`` strings (always present, mirroring
+        :meth:`send_photo`).
+        """
         chat_id = self._require_chat_id(chat_id)
         if not isinstance(media_items, list) or not media_items:
             raise EncodingError("media_items must be a non-empty list")
@@ -422,6 +430,8 @@ class TelegramClient:
         data: dict[str, Any] = {
             "chat_id": chat_id,
             "media": json.dumps(media),
+            "protect_content": "true" if protect_content else "false",
+            "disable_notification": "true" if disable_notification else "false",
         }
         result = self._call("sendMediaGroup", files=files, data=data, timeout=timeout)
         if not isinstance(result, list) or not all(

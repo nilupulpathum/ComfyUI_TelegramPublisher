@@ -559,3 +559,64 @@ def test_get_updates_never_leaks_token_shape_in_errors():
     except PermanentTelegramError as exc:
         assert token_like not in str(exc)
         assert token_like not in repr(exc)
+# -- T072: send_media_group forwards protect/silent flags (append-only) --
+
+
+def test_send_media_group_flags_default_false():
+    record: list = []
+    client = TelegramClient(
+        FAKE_TOKEN,
+        transport=make_fake(
+            200,
+            {"ok": True, "result": [{"message_id": 1}, {"message_id": 2}]},
+            record,
+        ),
+    )
+    assert client.send_media_group("-100123", [(b"a", "a.png"), (b"b", "b.png")]) == [1, 2]
+    assert record[0]["data"]["protect_content"] == "false"
+    assert record[0]["data"]["disable_notification"] == "false"
+
+
+def test_send_media_group_flags_true():
+    record: list = []
+    client = TelegramClient(
+        FAKE_TOKEN,
+        transport=make_fake(
+            200,
+            {"ok": True, "result": [{"message_id": 1}, {"message_id": 2}]},
+            record,
+        ),
+    )
+    assert (
+        client.send_media_group(
+            "-100123",
+            [(b"a", "a.png"), (b"b", "b.png")],
+            protect_content=True,
+            disable_notification=True,
+        )
+        == [1, 2]
+    )
+    assert record[0]["data"]["protect_content"] == "true"
+    assert record[0]["data"]["disable_notification"] == "true"
+
+
+def test_send_media_group_flags_mixed_with_timeout():
+    record: list = []
+    client = TelegramClient(
+        FAKE_TOKEN,
+        transport=make_fake(
+            200,
+            {"ok": True, "result": [{"message_id": 3}]},
+            record,
+        ),
+    )
+    client.send_media_group(
+        "-100123",
+        [(b"a", "a.png"), (b"b", "b.png")],
+        timeout=5.0,
+        protect_content=True,
+        disable_notification=False,
+    )
+    assert record[0]["timeout"] == 5.0
+    assert record[0]["data"]["protect_content"] == "true"
+    assert record[0]["data"]["disable_notification"] == "false"

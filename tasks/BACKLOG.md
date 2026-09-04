@@ -74,10 +74,10 @@ background threads at import).
   without autostarting anything. Must work with ComfyUI execution
   (no blocking beyond its own run) and degrade to a clear message
   when no admin chats are configured.
-- [ ] T071 Expire abandoned review payloads — TTL/GC for `pending_review`
+- [x] T071 Expire abandoned review payloads — TTL/GC for `pending_review`
   rows and their PNG files (Epic 6 risk: they accumulate until
   approved/rejected). Rejected-by-expiry must preserve the job record.
-- [ ] T072 Forward album flags — plumb `protect_content` /
+- [x] T072 Forward album flags — plumb `protect_content` /
   `disable_notification` through `send_media_group` (currently accepted
   by the node but ignored by the client wrapper).
 

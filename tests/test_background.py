@@ -531,9 +531,16 @@ class FakeTelegramClient:
         )
         return SimpleNamespace(message_id=99)
 
-    def send_media_group(self, chat_id, items, caption=None):
+    def send_media_group(
+        self, chat_id, items, caption=None,
+        protect_content=False, disable_notification=False,
+    ):
         self.album_calls.append(
-            {"chat_id": chat_id, "items": items, "caption": caption}
+            {
+                "chat_id": chat_id, "items": items, "caption": caption,
+                "protect_content": protect_content,
+                "disable_notification": disable_notification,
+            }
         )
         return [11, 12]
 
