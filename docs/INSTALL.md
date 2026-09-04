@@ -256,13 +256,43 @@ All remote control is OFF unless explicitly configured (see
 3. **Command list.** `/help`, `/status`, `/queue` (read-only);
    `/approve <jobid>`, `/reject <jobid>` (review); `/run <name>`
    (trigger a local workflow, see next step).
-4. **Trigger setup.** Add a named trigger pointing at a ComfyUI API
-   prompt file (JSON, at most 5 MB):
+4. **Trigger setup.** Add a named trigger pointing at a ComfyUI
+   prompt file (API-format **or** frontend canvas-format JSON, at most
+   5 MB):
    `"triggers": [{"name": "portrait",
    "prompt_file": "<ABSOLUTE_PATH_TO_PROMPT_JSON>"}]`, then run it from
-   chat with `/run portrait`. Triggers only ever POST to loopback
+   chat with `/run portrait`. Canvas (`nodes`/`links`) files are
+   auto-converted at run time using the target server's own
+   `/object_info` (read-only loopback GET, see `docs/SECURITY.md`).
+   Triggers only ever POST to loopback
    (`comfy_host` must be `127.0.0.1`, `localhost`, or `::1`;
    `comfy_port` defaults to `8188`).
+5. **Prompt text + auto-publish (T080/T081).** A trigger can take free
+   text (`/run anima a cat in moonlight`, at most 1500 chars) and
+   publish the result back to chat:
+   ```jsonc
+   {"name": "anima",
+    "prompt_file": "<ABSOLUTE_PATH_TO_ANIMA_CANVAS_JSON>",
+    "prompt_targets": [{"node": "28", "input": "text"}],
+    "prompt_required": false,
+    "publish": {"account": "<ACCOUNT_ID>",
+                "destination": "<DEST_ID>",
+                "caption_template": "{{prompt}}",
+                "format": "png", "quality": 90}}
+   ```
+   - `prompt_targets` names the `(node, input)` pairs the free text is
+     substituted into (the Anima canvas keeps its main prompt text in
+     node `28`, input `text`; the negative lives in node `3`). Linked
+     or missing targets refuse loudly instead of guessing. With
+     `prompt_required: true`, `/run anima` without text answers
+     `usage: /run anima <text>`; text sent to a trigger with no
+     targets is refused (`... takes no prompt text`) rather than
+     silently dropped.
+   - `publish` auto-appends a **Telegram Send Image** node wired from
+     the workflow's `VAEDecode` output (or an explicit
+     `"source": "<node_id>:<slot>"`), with the caption rendered from
+     `caption_template` against the run's prompt text (default
+     `{{prompt}}`). `format` is `png`/`jpeg`, `quality` is 1–100.
 
 ### Driving the bot: Telegram Command Poller node (T070)
 

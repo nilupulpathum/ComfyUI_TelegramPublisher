@@ -58,6 +58,16 @@ update is ignored silently, so scanners get no oracle).
   re-validated loopback-only (`127.0.0.1`, `localhost`, `::1`) at `/run`
   time, beyond save-time validation, so triggers can never be aimed at
   remote hosts via a config file.
+- **Canvas conversion fetch (T080).** Converting a canvas-format
+  trigger file performs one read-only `GET /object_info` against the
+  SAME loopback-validated `comfy_host`/`comfy_port` the `/prompt` POST
+  already uses — no new network surface: same host, same port, same
+  call-time validation, no query params, no credentials, and the
+  response (node input specs) is treated as data. Free text after
+  `/run <name>` is capped at 1500 chars and substituted only into the
+  trigger's declared `(node, input)` targets (refused loudly when a
+  target is linked/missing); it is never executed, only stored as a
+  prompt string and rendered into the publish caption.
 - **Reply hygiene.** Replies carry status/ids/truncated captions (80
   chars) only — never tokens, bytes, or tracebacks. Unexpected handler
   failures surface as the fixed string "error processing command" with

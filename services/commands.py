@@ -39,8 +39,16 @@ import urllib.request
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable
 
+from services.canvas import (
+    append_publish,
+    canvas_to_prompt,
+    detect_format,
+    fetch_object_info,
+)
+from services.captions import render_caption
 from services.review import ReviewStore
 from storage.config import (
     LOOPBACK_HOSTS,
@@ -439,12 +447,119 @@ def _reject(ctx: BotContext, cmd: IncomingCommand) -> str:
     return redact(f"rejected publish to {dest_name}")
 
 
+#: Max chars of free text accepted after ``/run <name>`` (T081).
+RUN_TEXT_MAX_CHARS = 1500
+
+
+def _normalize_prompt_map(parsed: Any, host: str, port: int) -> dict:
+    """Reduce a parsed prompt file to a bare API prompt map (T080).
+
+    Canvas files are converted via the target server's own
+    ``/object_info`` (same loopback-validated ``host``/``port`` the
+    ``/prompt`` POST uses); ``api_wrapped`` files unwrap one ``prompt``
+    level (bare maps pass through).
+
+    Raises:
+        ValueError: Unrecognized shape, malformed object_info, or a
+            conversion failure (caller replies ``misconfigured``).
+        ConnectionError: object_info unreachable (caller replies
+            ``trigger failed``).
+    """
+    format_ = detect_format(parsed)
+    if format_ == "canvas":
+        specs = fetch_object_info(
+            f"http://{host}:{port}", timeout=TRIGGER_HTTP_TIMEOUT
+        )
+        return canvas_to_prompt(parsed, specs)
+    if format_ == "api_wrapped":
+        inner = parsed["prompt"]
+        if not isinstance(inner, dict):
+            raise ValueError("prompt file 'prompt' wrapper must hold an object")
+        return inner
+    return parsed
+
+
+def _apply_prompt_targets(
+    prompt_map: dict, targets: tuple, text: str
+) -> str:
+    """Substitute ``text`` into each ``(node, input)`` target (T081).
+
+    Returns the pre-override value of the first target (``""`` when there
+    are no targets or it is not a string) so the caller can render the
+    publish caption from file text when no override was given.
+
+    Raises:
+        ValueError: Node missing, input missing, or the current value is
+            not a string (linked inputs arrive as ``[id, slot]`` lists
+            and are refused loudly rather than clobbered).
+    """
+    file_text = ""
+    first = True
+    for target in targets:
+        node_id = getattr(target, "node", None)
+        input_name = getattr(target, "input", "text")
+        node = prompt_map.get(node_id) if isinstance(prompt_map, dict) else None
+        if not isinstance(node, dict):
+            raise ValueError(f"prompt target node '{node_id}' not found")
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict) or input_name not in inputs:
+            raise ValueError(
+                f"prompt target input '{input_name}' not found on node '{node_id}'"
+            )
+        current = inputs[input_name]
+        if first:
+            first = False
+            if isinstance(current, str):
+                file_text = current
+        if text:
+            if not isinstance(current, str):
+                raise ValueError(
+                    f"prompt target {node_id}/{input_name} "
+                    "is not overridable (linked?)"
+                )
+            inputs[input_name] = text
+    return file_text
+
+
+def _apply_publish(
+    prompt_map: dict, publish_spec: Any, text: str, file_text: str
+) -> dict:
+    """Render the publish caption and append the Send Image node (T080).
+
+    The caption renders ``caption_template`` against
+    ``{"prompt": <override text, else file target text, else "">}``.
+    Render warnings are dropped deliberately: ``_run`` has no logger and
+    truncation is fail-safe. The settings-owned spec is never mutated
+    (caption travels on a copy). Raises :class:`ValueError` from
+    :func:`append_publish` (bad source, no VAEDecode) for the caller.
+    """
+    template = getattr(publish_spec, "caption_template", "{{prompt}}")
+    if not isinstance(template, str):
+        template = "{{prompt}}"
+    rendered = render_caption(template, {"prompt": text or file_text or ""})
+    ready = SimpleNamespace(
+        account=getattr(publish_spec, "account", ""),
+        destination=getattr(publish_spec, "destination", ""),
+        source=getattr(publish_spec, "source", None),
+        caption_template=rendered.text,
+        format=getattr(publish_spec, "format", "png"),
+        quality=getattr(publish_spec, "quality", 90),
+    )
+    return append_publish(prompt_map, ready)
+
+
 def _run(ctx: BotContext, cmd: IncomingCommand) -> str:
     if not _is_admin(ctx, cmd):
         return "not authorized"
     if not cmd.args:
         return "usage: /run <name>"
     name = cmd.args[0]
+    text = " ".join(cmd.args[1:])
+    if len(text) > RUN_TEXT_MAX_CHARS:
+        return (
+            f"prompt too long (max {RUN_TEXT_MAX_CHARS} characters, "
+            f"got {len(text)})"
+        )
     try:
         triggers = tuple(ctx.settings.triggers)
     except Exception:
@@ -454,6 +569,18 @@ def _run(ctx: BotContext, cmd: IncomingCommand) -> str:
         if not triggers:
             return f"unknown trigger '{name}' (no triggers configured)"
         return f"unknown trigger '{name}'"
+    try:
+        targets = tuple(getattr(match, "prompt_targets", ()) or ())
+    except Exception:
+        targets = ()
+    prompt_required = bool(getattr(match, "prompt_required", False))
+    publish_spec = getattr(match, "publish", None)
+    if text and not targets:
+        # Refuse loudly: silently dropping user text would look like the
+        # run used it.
+        return f"usage: /run {name} [text] (this trigger takes no prompt text)"
+    if not text and targets and prompt_required:
+        return f"usage: /run {name} <text>"
     path = Path(match.prompt_file)
     try:
         is_file = path.is_file()
@@ -490,8 +617,23 @@ def _run(ctx: BotContext, cmd: IncomingCommand) -> str:
         or not 1 <= port <= 65535
     ):
         return "trigger misconfigured: comfy_port must be an int in 1..65535"
+    try:
+        prompt_map = _normalize_prompt_map(parsed, host, port)
+    except ValueError as exc:
+        return redact(f"trigger misconfigured: {exc}")
+    except ConnectionError as exc:
+        return redact(f"trigger failed: {exc}")
+    try:
+        file_text = _apply_prompt_targets(prompt_map, targets, text)
+    except ValueError as exc:
+        return redact(f"trigger misconfigured: {exc}")
+    if publish_spec is not None:
+        try:
+            prompt_map = _apply_publish(prompt_map, publish_spec, text, file_text)
+        except ValueError as exc:
+            return redact(f"trigger misconfigured: {exc}")
     url = f"http://{host}:{port}/prompt"
-    body = json.dumps({"prompt": parsed}).encode("utf-8")
+    body = json.dumps({"prompt": prompt_map}).encode("utf-8")
     request = urllib.request.Request(
         url,
         data=body,

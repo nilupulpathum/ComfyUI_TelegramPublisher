@@ -55,17 +55,83 @@ LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 
 @dataclass
+class PromptTarget:
+    """One ``(node, input)`` prompt-text override target (T081).
+
+    ``node`` is the API-map node id (stringified int for converted
+    canvas workflows, e.g. ``"28"``); ``input`` is the input name
+    (default ``"text"``). Both must be non-empty strings.
+    """
+
+    node: str
+    input: str = "text"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.node, str) or not self.node.strip():
+            raise ValueError("prompt_target.node must be a non-empty string")
+        if not isinstance(self.input, str) or not self.input.strip():
+            raise ValueError("prompt_target.input must be a non-empty string")
+
+
+@dataclass
+class PublishSpec:
+    """Auto-appended publish block for a trigger (T080).
+
+    ``account``/``destination`` are configured ids; ``source`` is
+    ``"id:slot"`` (explicit image source) or None (auto-detect the first
+    ``VAEDecode`` node, slot 0); ``caption_template`` is rendered at
+    ``/run`` time against ``{"prompt": <override or file text>}``;
+    ``format``/``quality`` are the encoder settings.
+    """
+
+    account: str
+    destination: str
+    source: str | None = None
+    caption_template: str = "{{prompt}}"
+    format: str = "png"
+    quality: int = 90
+
+    def __post_init__(self) -> None:
+        _require_non_empty_str(self.account, "publish.account")
+        _require_non_empty_str(self.destination, "publish.destination")
+        if self.source is not None:
+            _require_non_empty_str(self.source, "publish.source")
+        if not isinstance(self.caption_template, str):
+            raise ValueError("publish.caption_template must be a string")
+        if self.format not in ("png", "jpeg"):
+            raise ValueError("publish.format must be one of ('png', 'jpeg')")
+        if (
+            not isinstance(self.quality, int)
+            or isinstance(self.quality, bool)
+            or not 1 <= self.quality <= 100
+        ):
+            raise ValueError("publish.quality must be an int in 1..100")
+
+
+@dataclass
 class Trigger:
     """A named remote-workflow trigger (resolved at ``/run`` time)."""
 
     name: str
     prompt_file: str
+    prompt_targets: tuple[PromptTarget, ...] = ()
+    prompt_required: bool = False
+    publish: PublishSpec | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
             raise ValueError("trigger.name must be a non-empty string")
         if not isinstance(self.prompt_file, str) or not self.prompt_file.strip():
             raise ValueError("trigger.prompt_file must be a non-empty string")
+        if not isinstance(self.prompt_targets, (tuple, list)):
+            raise ValueError("trigger.prompt_targets must be a list of PromptTarget")
+        for entry in self.prompt_targets:
+            if not isinstance(entry, PromptTarget):
+                raise ValueError("trigger.prompt_targets entries must be PromptTarget")
+        if not isinstance(self.prompt_required, bool):
+            raise ValueError("trigger.prompt_required must be a bool")
+        if self.publish is not None and not isinstance(self.publish, PublishSpec):
+            raise ValueError("trigger.publish must be a PublishSpec or None")
 
 
 @dataclass
@@ -292,10 +358,7 @@ class ConfigStore:
             admin_chat_ids=tuple(self._settings.admin_chat_ids),
             comfy_host=self._settings.comfy_host,
             comfy_port=self._settings.comfy_port,
-            triggers=tuple(
-                Trigger(name=t.name, prompt_file=t.prompt_file)
-                for t in self._settings.triggers
-            ),
+            triggers=tuple(_copy_trigger(t) for t in self._settings.triggers),
         )
 
     def save_settings(self, settings: BotSettings) -> BotSettings:
@@ -476,6 +539,32 @@ def _validate_comfy_port(value: object) -> int:
     return value
 
 
+def _copy_trigger(trigger: Trigger) -> Trigger:
+    """Deep-copy a trigger (new PromptTarget/PublishSpec objects)."""
+    publish = trigger.publish
+    return Trigger(
+        name=trigger.name,
+        prompt_file=trigger.prompt_file,
+        prompt_targets=tuple(
+            PromptTarget(node=t.node, input=t.input)
+            for t in trigger.prompt_targets
+        ),
+        prompt_required=trigger.prompt_required,
+        publish=(
+            None
+            if publish is None
+            else PublishSpec(
+                account=publish.account,
+                destination=publish.destination,
+                source=publish.source,
+                caption_template=publish.caption_template,
+                format=publish.format,
+                quality=publish.quality,
+            )
+        ),
+    )
+
+
 def _validate_triggers(value: object) -> tuple[Trigger, ...]:
     if not isinstance(value, (tuple, list)):
         raise ValueError("triggers must be a list of Trigger entries")
@@ -490,9 +579,7 @@ def _validate_triggers(value: object) -> tuple[Trigger, ...]:
                 f"duplicate trigger name '{entry.name}' (names must be unique)"
             )
         seen.add(entry.name)
-        triggers.append(
-            Trigger(name=entry.name, prompt_file=entry.prompt_file)
-        )
+        triggers.append(_copy_trigger(entry))
     return tuple(triggers)
 
 
@@ -532,18 +619,7 @@ def _settings_from_raw(raw: object, source: str) -> BotSettings:
             raise ValueError(
                 f"config file '{source}': trigger entries must be objects"
             )
-        unknown_t = set(entry.keys()) - {"name", "prompt_file"}
-        if unknown_t:
-            raise ValueError(
-                f"config file '{source}': unknown trigger key(s) "
-                f"{sorted(str(k) for k in unknown_t)}"
-            )
-        triggers.append(
-            Trigger(
-                name=entry.get("name", ""),  # type: ignore[arg-type]
-                prompt_file=entry.get("prompt_file", ""),  # type: ignore[arg-type]
-            )
-        )
+        triggers.append(_trigger_from_dict(entry, source))
     return _normalize_settings(
         BotSettings(
             review_mode=raw.get("review_mode", False),  # type: ignore[arg-type]
@@ -555,14 +631,120 @@ def _settings_from_raw(raw: object, source: str) -> BotSettings:
     )
 
 
+_TRIGGER_KEYS = frozenset(
+    {"name", "prompt_file", "prompt_targets", "prompt_required", "publish"}
+)
+
+
+def _prompt_target_from_dict(entry: object, source: str) -> PromptTarget:
+    if not isinstance(entry, dict):
+        raise ValueError(
+            f"config file '{source}': prompt_targets entries must be objects"
+        )
+    unknown = set(entry.keys()) - {"node", "input"}
+    if unknown:
+        raise ValueError(
+            f"config file '{source}': unknown prompt_target key(s) "
+            f"{sorted(str(k) for k in unknown)}"
+        )
+    return PromptTarget(
+        node=entry.get("node", ""),  # type: ignore[arg-type]
+        input=entry.get("input", "text"),  # type: ignore[arg-type]
+    )
+
+
+def _publish_from_dict(entry: object, source: str) -> PublishSpec:
+    if not isinstance(entry, dict):
+        raise ValueError(f"config file '{source}': 'publish' must be an object")
+    unknown = set(entry.keys()) - {
+        "account",
+        "destination",
+        "source",
+        "caption_template",
+        "format",
+        "quality",
+    }
+    if unknown:
+        raise ValueError(
+            f"config file '{source}': unknown publish key(s) "
+            f"{sorted(str(k) for k in unknown)}"
+        )
+    if "account" not in entry or "destination" not in entry:
+        raise ValueError(
+            f"config file '{source}': 'publish' needs 'account' and 'destination'"
+        )
+    return PublishSpec(
+        account=entry.get("account", ""),  # type: ignore[arg-type]
+        destination=entry.get("destination", ""),  # type: ignore[arg-type]
+        source=entry.get("source"),  # type: ignore[arg-type]
+        caption_template=entry.get("caption_template", "{{prompt}}"),  # type: ignore[arg-type]
+        format=entry.get("format", "png"),  # type: ignore[arg-type]
+        quality=entry.get("quality", 90),  # type: ignore[arg-type]
+    )
+
+
+def _trigger_from_dict(entry: dict, source: str) -> Trigger:
+    """Parse one trigger object; absent new keys fall back to defaults."""
+    unknown_t = set(entry.keys()) - _TRIGGER_KEYS
+    if unknown_t:
+        raise ValueError(
+            f"config file '{source}': unknown trigger key(s) "
+            f"{sorted(str(k) for k in unknown_t)}"
+        )
+    targets_raw = entry.get("prompt_targets", ())
+    if not isinstance(targets_raw, (tuple, list)):
+        raise ValueError(
+            f"config file '{source}': 'prompt_targets' must be a list"
+        )
+    targets = [_prompt_target_from_dict(e, source) for e in targets_raw]
+    publish_raw = entry.get("publish")
+    publish = (
+        None if publish_raw is None else _publish_from_dict(publish_raw, source)
+    )
+    return Trigger(
+        name=entry.get("name", ""),  # type: ignore[arg-type]
+        prompt_file=entry.get("prompt_file", ""),  # type: ignore[arg-type]
+        prompt_targets=targets,  # type: ignore[arg-type]
+        prompt_required=entry.get("prompt_required", False),  # type: ignore[arg-type]
+        publish=publish,
+    )
+
+
+def _trigger_to_dict(trigger: Trigger) -> dict:
+    """Serialize one trigger; default-valued new keys are omitted.
+
+    Omission keeps old-shape round-trips byte-identical
+    (``{"name", "prompt_file"}`` only when nothing new is set).
+    """
+    payload: dict = {"name": trigger.name, "prompt_file": trigger.prompt_file}
+    if trigger.prompt_targets:
+        payload["prompt_targets"] = [
+            {"node": t.node, "input": t.input} for t in trigger.prompt_targets
+        ]
+    if trigger.prompt_required:
+        payload["prompt_required"] = True
+    if trigger.publish is not None:
+        publish: dict = {
+            "account": trigger.publish.account,
+            "destination": trigger.publish.destination,
+        }
+        if trigger.publish.source is not None:
+            publish["source"] = trigger.publish.source
+        if trigger.publish.caption_template != "{{prompt}}":
+            publish["caption_template"] = trigger.publish.caption_template
+        if trigger.publish.format != "png":
+            publish["format"] = trigger.publish.format
+        if trigger.publish.quality != 90:
+            publish["quality"] = trigger.publish.quality
+        payload["publish"] = publish
+    return payload
+
+
 def _settings_to_dict(settings: BotSettings) -> dict:
     return {
         "review_mode": settings.review_mode,
         "admin_chat_ids": list(settings.admin_chat_ids),
         "comfy_host": settings.comfy_host,
         "comfy_port": settings.comfy_port,
-        "triggers": [
-            {"name": t.name, "prompt_file": t.prompt_file}
-            for t in settings.triggers
-        ],
+        "triggers": [_trigger_to_dict(t) for t in settings.triggers],
     }

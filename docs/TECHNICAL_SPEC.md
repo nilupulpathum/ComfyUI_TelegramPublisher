@@ -345,7 +345,14 @@ For MVP, a local secret file with restrictive permissions is acceptable; impleme
     "comfy_host": "127.0.0.1",     // loopback only (save-time validated)
     "comfy_port": 8188,
     "triggers": [                  // default empty = /run runs nothing
-      {"name": "portrait", "prompt_file": "workflows/portrait_api.json"}
+      {"name": "portrait", "prompt_file": "workflows/portrait_api.json"},
+      {"name": "anima",             // T080/T081: canvas + override + publish
+       "prompt_file": "<ABSOLUTE_PATH_TO_CANVAS_JSON>",
+       "prompt_targets": [{"node": "28", "input": "text"}],
+       "prompt_required": false,
+       "publish": {"account": "my-account", "destination": "my-channel",
+                   "caption_template": "{{prompt}}",
+                   "format": "png", "quality": 90}}
     ]
   }
 }
@@ -360,7 +367,7 @@ For MVP, a local secret file with restrictive permissions is acceptable; impleme
 | `/queue` | — | queued/sending jobs (caption preview 80 chars) | listing or "queue is empty" |
 | `/approve` | `<jobid>` | send staged payload once, mark `success` | `published to <dest>, message <id>` |
 | `/reject` | `<jobid>` | drop staged payload, mark `failed`/`Rejected` | `rejected publish to <dest>` |
-| `/run` | `<name>` | POST prompt file to local ComfyUI `/prompt` | `workflow started: <prompt_id>` |
+| `/run` | `<name> [text]` | POST prompt file to local ComfyUI `/prompt` (canvas auto-converted, text substituted into `prompt_targets`, publish node auto-appended) | `workflow started: <prompt_id>` |
 
 Unknown commands and non-command text get NO reply. Non-allowlisted
 chats get NO reply (warning log with chat id only). Handler failures
@@ -420,14 +427,105 @@ deterministic tests. GC host: the Telegram Command Poller node calls it
 best-effort once per `poll()` run with the default TTL before the first
 `getUpdates` poll; any GC failure warns and polling continues.
 
-### 9.4 Trigger contract (T065)
+### 9.4 Trigger contract (T065, extended T080/T081)
 
-`/run <name>` resolves `<name>` against `settings.triggers` (no match
--> `unknown trigger '<name>'`, empty list ->
-`unknown trigger '<name>' (no triggers configured)`). The prompt file
-must exist, be a regular file, and be at most 5 MB
-(`trigger misconfigured: ...` otherwise); it must hold JSON, posted as
-`{"prompt": <parsed>}` via stdlib `urllib` to
+`/run <name> [text...]` resolves `<name>` against `settings.triggers`
+(no match -> `unknown trigger '<name>'`, empty list ->
+`unknown trigger '<name>' (no triggers configured)`). Free text is
+`" ".join(args[1:])`, capped at 1500 chars (`prompt too long ...`
+otherwise). The prompt file must exist, be a regular file, and be at
+most 5 MB (`trigger misconfigured: ...` otherwise); it must hold JSON.
+
+#### 9.4.1 Prompt file formats (T080)
+
+`services.canvas.detect_format` classifies the parsed file:
+
+- `canvas`: dict with list `nodes` + list `links` (frontend save
+  format) — converted at run time (see 9.4.2);
+- `api_wrapped`: single top key `prompt` holding the node map — the
+  inner map is used (one `prompt` level is unwrapped);
+- `api_bare`: non-empty dict of `{id: {class_type, inputs}}` — used
+  as-is (same bytes as the T065 path).
+
+Anything else is `trigger misconfigured: ...`.
+
+#### 9.4.2 Canvas conversion (T080)
+
+Canvas files convert via `services.canvas.canvas_to_prompt` using the
+target server's own `/object_info` (read-only GET to the same
+loopback-validated `http://<host>:<port>`, timeout 30 s; transport
+failures -> `trigger failed: ...`, malformed/conversion failures ->
+`trigger misconfigured: ...`). `object_info` is taken as data
+(`{"Type": {"input": {"required": {name: [typedef, opts]}}}}`).
+
+Conversion rules:
+
+- Keep nodes with `mode` in `(0, None/missing)`; DROP `mode != 0`,
+  types `{"Note", "Reroute"}`, and types starting with `"Label"`.
+  Entries missing `id`/`type` -> `ValueError` listing them.
+- Links resolve via the links table
+  (`[id, from_node, from_slot, to_node, to_slot, type]`). A kept input
+  whose link id is missing or points at a dropped/missing node ->
+  `ValueError` naming node+input (fail loudly, never silently rewire).
+- Per kept node (`str(id)` keys): linked inputs become
+  `[str(from_node), from_slot]`; unlinked inputs WITH a `"widget"`
+  marker consume `widgets_values` positionally, SKIPPING top-level
+  dict values (custom-node UI state such as LoraManager autocomplete
+  metadata — never backend inputs), falling back to the spec required
+  default when values run out; unlinked inputs WITHOUT a marker take
+  the spec required default; no value and no default -> `ValueError`
+  naming node+input. Unknown node types (absent from `object_info`)
+  -> `ValueError` naming the type.
+- Spec defaults: `required[name] = [typedef, opts]`; the default is
+  `opts.get("default")` when `opts` is a dict. Optional inputs are
+  included ONLY when linked (frontend parity).
+- Known approximation: `widgets_values` mapping is positional, so
+  value-only widgets without a canvas input entry (e.g. KSampler's
+  `control_after_generate`) shift the values that follow. The live
+  Anima trial (T082) must confirm real workflows convert faithfully.
+
+#### 9.4.3 Prompt text override (T081)
+
+Each trigger may declare `prompt_targets: [{"node": "<id>",
+"input": "<name>"}]` (default `input` is `"text"`) plus
+`prompt_required: bool` (default `false`):
+
+- text given + targets: every target is set to the text. Target node
+  missing, input missing, or the current value not a string (linked
+  inputs arrive as `[id, slot]` lists) -> `trigger misconfigured: ...`
+  (`... is not overridable (linked?)` for the non-string case).
+- text given + NO targets: refused loudly
+  (`usage: /run <name> [text] (this trigger takes no prompt text)` —
+  user text is never silently dropped).
+- no text + targets + `prompt_required`: `usage: /run <name> <text>`;
+  no text + not required: file text is kept.
+
+#### 9.4.4 Publish auto-append (T080)
+
+A trigger `publish` block
+(`{account, destination, source?, caption_template?,
+format?, quality?}`; defaults `caption_template="{{prompt}}"`,
+`format="png"`, `quality=90`) appends a `Telegram Send Image` node via
+`services.canvas.append_publish` after the override step:
+
+- Source: explicit `source: "id:slot"` (node must exist in the map) or
+  auto-detect — the first `VAEDecode` node in map order supplies slot
+  0 (the API map carries no output metadata, so the slot is a
+  documented convention). No VAEDecode / bad source -> `trigger
+  misconfigured: ...`.
+- The new id is `str(max(int ids) + 1)` (`"telegram_send_1"` when no
+  key parses as an int). The input map is copied, never mutated.
+- Node inputs: `image [src_id, 0]`, `account`, `destination`,
+  `caption` (already rendered — see below), `format`, `quality`,
+  `protect_content False`, `disable_notification False`,
+  `skip_duplicate False`, `wait_for_upload True`.
+- Caption: `render_caption(caption_template, {"prompt": <override
+  text, else the first target's file text, else "">})`. Render
+  warnings are dropped deliberately (`_run` has no logger; truncation
+  is fail-safe and still applies).
+
+The converted map (with overrides + appended node) is posted as
+`{"prompt": <map>}` via stdlib `urllib` to
 `http://<comfy_host>:<comfy_port>/prompt` (timeout 30 s, loopback
 re-validated at call time). The response must hold `prompt_id`
 (`workflow started: <prompt_id>`); every transport/parse failure maps

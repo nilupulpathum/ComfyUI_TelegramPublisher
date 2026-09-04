@@ -15,6 +15,8 @@ from storage.config import (
     ConfigStore,
     Destination,
     FileSecretStore,
+    PromptTarget,
+    PublishSpec,
     Trigger,
 )
 
@@ -446,3 +448,136 @@ def test_settings_file_round_trips_json_shape(tmp_path: Path) -> None:
     assert raw["settings"]["admin_chat_ids"] == ["42"]
     assert raw["settings"]["triggers"] == [{"name": "t", "prompt_file": "p.json"}]
     assert TOKEN_A.encode() not in (tmp_path / "config.json").read_bytes()
+
+
+# ---------------------------------------------------------------------------
+# T080/T081 trigger prompt targets + publish block (append-only additions)
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_target_rejects_empty_fields() -> None:
+    with pytest.raises(ValueError):
+        PromptTarget(node="")
+    with pytest.raises(ValueError):
+        PromptTarget(node="  ")
+    with pytest.raises(ValueError):
+        PromptTarget(node="28", input="")
+    with pytest.raises(ValueError):
+        PromptTarget(node=28)  # type: ignore[arg-type]
+    assert PromptTarget(node="28") == PromptTarget(node="28", input="text")
+
+
+def test_publish_spec_validation() -> None:
+    PublishSpec(account="a", destination="d")  # defaults incl. {{prompt}}
+    with pytest.raises(ValueError):
+        PublishSpec(account="", destination="d")
+    with pytest.raises(ValueError):
+        PublishSpec(account="a", destination="")
+    with pytest.raises(ValueError):
+        PublishSpec(account="a", destination="d", format="gif")
+    for bad_quality in (0, 101, True, "90", None):
+        with pytest.raises(ValueError):
+            PublishSpec(account="a", destination="d", quality=bad_quality)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        PublishSpec(account="a", destination="d", source="")  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        PublishSpec(account="a", destination="d", caption_template=None)  # type: ignore[arg-type]
+
+
+def test_trigger_new_fields_default_and_validate() -> None:
+    trigger = Trigger(name="t", prompt_file="p.json")
+    assert trigger.prompt_targets == ()
+    assert trigger.prompt_required is False
+    assert trigger.publish is None
+    with pytest.raises(ValueError):
+        Trigger(name="t", prompt_file="p.json",
+                prompt_targets=["28"])  # type: ignore[list-item]
+    with pytest.raises(ValueError):
+        Trigger(name="t", prompt_file="p.json",
+                prompt_required="yes")  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        Trigger(name="t", prompt_file="p.json",
+                publish={"account": "a"})  # type: ignore[arg-type]
+
+
+def test_settings_trigger_new_fields_round_trip(tmp_path: Path) -> None:
+    config, _ = make_store(tmp_path)
+    saved = config.save_settings(
+        BotSettings(
+            admin_chat_ids=["1"],
+            triggers=[
+                Trigger(
+                    name="anima",
+                    prompt_file="anima.json",
+                    prompt_targets=[PromptTarget(node="28")],
+                    prompt_required=True,
+                    publish=PublishSpec(
+                        account="a", destination="d", source="6:0",
+                        caption_template="{{prompt}}", format="jpeg",
+                        quality=80,
+                    ),
+                )
+            ],
+        )
+    )
+    trigger = saved.triggers[0]
+    assert trigger.prompt_targets == (PromptTarget(node="28"),)
+    assert trigger.prompt_required is True
+    assert trigger.publish == PublishSpec(
+        account="a", destination="d", source="6:0",
+        caption_template="{{prompt}}", format="jpeg", quality=80,
+    )
+    reloaded = ConfigStore(tmp_path / "config.json")
+    assert reloaded.get_settings() == saved
+    raw = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert raw["settings"]["triggers"][0] == {
+        "name": "anima",
+        "prompt_file": "anima.json",
+        "prompt_targets": [{"node": "28", "input": "text"}],
+        "prompt_required": True,
+        "publish": {
+            "account": "a", "destination": "d", "source": "6:0",
+            "format": "jpeg", "quality": 80,
+        },
+    }
+
+
+def test_settings_trigger_old_files_without_new_keys_load(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {"settings": {"triggers": [{"name": "t",
+                                        "prompt_file": "p.json"}]}}
+        ),
+        encoding="utf-8",
+    )
+    trigger = ConfigStore(path).get_settings().triggers[0]
+    assert trigger.prompt_targets == ()
+    assert trigger.prompt_required is False
+    assert trigger.publish is None
+
+
+def test_settings_trigger_rejects_bad_new_fields(tmp_path: Path) -> None:
+    bad_triggers = [
+        {"name": "t", "prompt_file": "p.json", "prompt_targets": "28"},
+        {"name": "t", "prompt_file": "p.json",
+         "prompt_targets": [{"node": ""}]},
+        {"name": "t", "prompt_file": "p.json",
+         "prompt_targets": [{"node": "28", "bogus": 1}]},
+        {"name": "t", "prompt_file": "p.json", "prompt_required": "yes"},
+        {"name": "t", "prompt_file": "p.json",
+         "publish": {"account": "a"}},
+        {"name": "t", "prompt_file": "p.json",
+         "publish": {"account": "a", "destination": "d", "bogus": 1}},
+        {"name": "t", "prompt_file": "p.json",
+         "publish": {"account": "a", "destination": "d", "format": "gif"}},
+        {"name": "t", "prompt_file": "p.json", "bogus_key": 1},
+    ]
+    for bad_trigger in bad_triggers:
+        path = tmp_path / "config.json"
+        path.write_text(
+            json.dumps({"settings": {"triggers": [bad_trigger]}}),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError):
+            ConfigStore(path)

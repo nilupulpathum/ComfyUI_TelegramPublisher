@@ -81,6 +81,26 @@ background threads at import).
   `disable_notification` through `send_media_group` (currently accepted
   by the node but ignored by the client wrapper).
 
+## Epic 8 — Telegram generation triggers (open)
+
+Goal: generate ComfyUI images through Telegram — `/run <name> <prompt
+text>` starts a workflow whose result is published back to the chat.
+
+- [x] T080 Canvas workflows + auto-publish triggers — `/run` accepts
+  canvas-format (`nodes`/`links`) prompt files (auto-converted at run
+  time using the target server's own `/object_info` for exact input
+  specs; API-format files keep working as today) and a trigger
+  `publish` block auto-appends a Send Image node wired from the
+  workflow's VAEDecode output (or an explicit `source`). Register the
+  Anima workflow as the first trigger.
+- [x] T081 Prompt text override — `/run <name> <free text>` substitutes
+  the text into configured `(node, input)` targets (refusing linked or
+  non-string targets loudly); the same text renders the publish
+  caption (default template `{{prompt}}`).
+- [ ] T082 Live-verify the Anima trigger end-to-end (needs ComfyUI
+  running: poller queued, `/run anima <text>` from Telegram, photo
+  arrives, validation errors iterated if the converter misses).
+
 ## Vibe-coding execution order
 
 Epics 1–6 complete. Suggested order for Epic 7:
